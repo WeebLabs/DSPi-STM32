@@ -30,3 +30,4 @@ __pycache__/
 !Documentation/current_architecture.md
 !Documentation/Roadmap.md
 !Documentation/Features/*.md
+!Documentation/Porting/*.md
