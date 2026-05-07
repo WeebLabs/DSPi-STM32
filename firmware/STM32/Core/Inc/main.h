@@ -36,4 +36,9 @@ extern UART_HandleTypeDef huart_log;
 
 void Error_Handler(void);
 
+/* M2 USB — see usb_glue.c */
+void USB_HW_Init(void);    /* clocks, GPIO, voltage detector, NVIC */
+void USB_App_Init(void);   /* tud_init(0) */
+void USB_Task(void);       /* tud_task() — call from main loop */
+
 #endif

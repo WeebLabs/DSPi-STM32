@@ -21,6 +21,7 @@
  */
 
 #include "main.h"
+#include "tusb.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -50,25 +51,51 @@ int main(void) {
     Log_USART_Init();
     MCO_Init_PLL2P();
 
+    USB_HW_Init();    /* GPIO + USB peripheral clock + voltage detector + NVIC */
+    USB_App_Init();   /* tud_init(0) — TinyUSB device stack */
+
     printf("\r\n");
-    printf("=== DSPi STM32H723 — M0 alive ===\r\n");
+    printf("=== DSPi STM32H723 — M2 USB vendor echo ===\r\n");
     printf("  SYSCLK    = %lu Hz\r\n", (unsigned long)HAL_RCC_GetSysClockFreq());
     printf("  HCLK      = %lu Hz\r\n", (unsigned long)HAL_RCC_GetHCLKFreq());
     printf("  PCLK1     = %lu Hz\r\n", (unsigned long)HAL_RCC_GetPCLK1Freq());
     printf("  PCLK2     = %lu Hz\r\n", (unsigned long)HAL_RCC_GetPCLK2Freq());
     printf("  HSE       = %lu Hz (board crystal)\r\n", (unsigned long)HSE_VALUE);
-    printf("  PLL2_P on MCO1 (PA8) — scope to verify ~49.152 MHz\r\n");
-    printf("  Heartbeat LED on PB5 (1 Hz)\r\n");
+    printf("  USB FS    = PLL3Q -> 48 MHz (vendor echo, VID 0xCAFE PID 0x4001)\r\n");
+    printf("  Heartbeat LED on PE3 (1 Hz, on-board BLUE_LED, active LOW)\r\n");
 
+    /* Main loop runs the USB task continuously and toggles the heartbeat
+     * about once per second based on a millisecond counter rather than a
+     * blocking HAL_Delay so tud_task() keeps draining the USB IRQ work
+     * queue without a 500 ms gap between calls. */
+    /* Heartbeat encodes USB state visually so a board with no UART hooked
+     * up still reports enumeration:
+     *   1 Hz   = idle (USB device stack alive, host hasn't enumerated)
+     *   4 Hz   = mounted (host completed SetConfiguration)
+     *  10 Hz   = was mounted, then unmounted — host disconnected/suspended
+     */
+    uint32_t last_blink_ms = 0;
     uint32_t tick = 0;
+    bool was_ever_mounted = false;
     for (;;) {
-        HAL_GPIO_TogglePin(HEARTBEAT_LED_PORT, HEARTBEAT_LED_PIN);
-        HAL_Delay(500);
-        if ((tick & 0x07) == 0) {
-            printf("tick %lu  uptime=%lu ms\r\n",
-                   (unsigned long)tick, (unsigned long)HAL_GetTick());
+        USB_Task();
+
+        uint32_t now = HAL_GetTick();
+        bool mounted = tud_mounted();
+        if (mounted) was_ever_mounted = true;
+
+        uint32_t blink_period = mounted ? 125 : (was_ever_mounted ? 50 : 500);
+        if (now - last_blink_ms >= blink_period) {
+            last_blink_ms = now;
+            HAL_GPIO_TogglePin(HEARTBEAT_LED_PORT, HEARTBEAT_LED_PIN);
+            if ((tick & 0x07) == 0) {
+                printf("tick %lu  uptime=%lu ms  usb=%s\r\n",
+                       (unsigned long)tick,
+                       (unsigned long)now,
+                       mounted ? "mounted" : (was_ever_mounted ? "lost" : "idle"));
+            }
+            tick++;
         }
-        tick++;
     }
 }
 
@@ -116,7 +143,9 @@ static void SystemClock_Config(void) {
     if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_4) != HAL_OK) Error_Handler();
 
     /* PLL2 — audio kernel clock 49.15223 MHz (FRACN). Section 0.5. */
-    periph.PeriphClockSelection = RCC_PERIPHCLK_USART1;
+    periph.PeriphClockSelection = RCC_PERIPHCLK_USART1
+                                | RCC_PERIPHCLK_USB;
+    /* PLL2 — audio kernel clock 49.151978 MHz */
     periph.PLL2.PLL2M = 5;        /* 25/5 = 5 MHz VCO input */
     periph.PLL2.PLL2N = 98;
     periph.PLL2.PLL2P = 10;       /* VCO 491.52 MHz / 10 → 49.15198 MHz */
@@ -125,7 +154,23 @@ static void SystemClock_Config(void) {
     periph.PLL2.PLL2RGE    = RCC_PLL2VCIRANGE_2;   /* 4–8 MHz: 5 MHz fits */
     periph.PLL2.PLL2VCOSEL = RCC_PLL2VCOWIDE;      /* wide 192–836 MHz */
     periph.PLL2.PLL2FRACN  = 2490;                 /* −0.45 ppm vs 49.152 MHz */
+
+    /* PLL3 — USB FS @ exactly 48 MHz on PLL3Q.
+     *   25 MHz / DIVM3=10 = 2.5 MHz VCO input (RGE_1: 2–4 MHz)
+     *   2.5 MHz × 96 = 240 MHz VCO (WIDE: 192–836 MHz)
+     *   240 / 5 = 48 MHz on PLL3Q  →  USBCLKSOURCE_PLL3
+     * Same recipe the H750 WeAct BSP uses on identical 25 MHz HSE. */
+    periph.PLL3.PLL3M = 10;
+    periph.PLL3.PLL3N = 96;
+    periph.PLL3.PLL3P = 5;
+    periph.PLL3.PLL3Q = 5;
+    periph.PLL3.PLL3R = 2;
+    periph.PLL3.PLL3RGE    = RCC_PLL3VCIRANGE_1;
+    periph.PLL3.PLL3VCOSEL = RCC_PLL3VCOWIDE;
+    periph.PLL3.PLL3FRACN  = 0;
+
     periph.Usart16ClockSelection = RCC_USART16CLKSOURCE_D2PCLK2;
+    periph.UsbClockSelection     = RCC_USBCLKSOURCE_PLL3;
     if (HAL_RCCEx_PeriphCLKConfig(&periph) != HAL_OK) Error_Handler();
 }
 
