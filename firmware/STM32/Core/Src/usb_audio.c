@@ -111,6 +111,16 @@ static uint16_t uac1_open(uint8_t rhport,
         }
         p += p[0];
     }
+
+    /* Enable SOF event delivery for the audio class. Required: the dwc2
+     * ISO IN feedback transfer logic uses the SOF interrupt to schedule
+     * the next packet's data into the FIFO before the host's IN token
+     * arrives. Without this enabled, subsequent feedback transfers may
+     * silently produce zero-length packets after the first few frames,
+     * which the host eventually treats as a dead device and USB-suspends
+     * — matching the symptom of "device disappears after ~15-50 s." */
+    usbd_sof_enable(rhport, SOF_CONSUMER_AUDIO, true);
+
     return (uint16_t)(p - (uint8_t const *)itf_desc);
 }
 
@@ -130,38 +140,61 @@ static uint16_t uac1_open(uint8_t rhport,
 #define UAC1_REQ_GET_MAX  0x83
 #define UAC1_REQ_GET_RES  0x84
 
+/* UAC1 class-request wIndex layout (USB Audio 1.0 spec §5.2.1.1):
+ *
+ *   bmRequestType.recipient = 0x01 (Interface):
+ *       wIndex.HI = entity ID (input terminal / feature unit / output term)
+ *       wIndex.LO = interface number
+ *
+ *   bmRequestType.recipient = 0x02 (Endpoint):
+ *       wIndex.HI = 0
+ *       wIndex.LO = endpoint address
+ *
+ * The earlier draft used tu_u16_low() unconditionally, which made every
+ * feature-unit query fall through to the sample-rate clause (cs=0x01 is
+ * also AUDIO_FU_CTRL_MUTE) and return 3 bytes for a 1-byte mute query.
+ * macOS detects the wLength mismatch on enumeration tolerates it, but
+ * tears down the device a few seconds after SET_INTERFACE alt 1 once it
+ * notices the feature-unit interrogations are also broken. */
+
+#define UAC1_RECIPIENT_INTERFACE  0x01
+#define UAC1_RECIPIENT_ENDPOINT   0x02
+
 static bool handle_get_request(uint8_t stage, tusb_control_request_t const *req) {
     if (stage != CONTROL_STAGE_SETUP) return true;
 
-    uint8_t const cs        = tu_u16_high(req->wValue);   /* control selector */
-    uint8_t const cn        = tu_u16_low (req->wValue);   /* channel number   */
-    uint8_t const recipient = tu_u16_low (req->wIndex);   /* unit ID or EP    */
+    uint8_t const cs    = tu_u16_high(req->wValue);   /* control selector */
+    uint8_t const cn    = tu_u16_low (req->wValue);   /* channel number   */
+    uint8_t const recip = req->bmRequestType & 0x1F;
 
-    /* Feature-unit master controls */
-    if (recipient == UAC1_FEATURE_UNIT_ID && cn == 0) {
-        if (cs == AUDIO_FU_CTRL_MUTE) {
-            static uint8_t v = 0;
-            return tud_control_xfer(0, (tusb_control_request_t *)req, &v, 1);
-        }
-        if (cs == AUDIO_FU_CTRL_VOLUME) {
-            static int16_t cur = 0, min = -90 * 256, max = 0, res = 256;
-            switch (req->bRequest) {
-                case UAC1_REQ_GET_CUR: return tud_control_xfer(0, (tusb_control_request_t *)req, &cur, 2);
-                case UAC1_REQ_GET_MIN: return tud_control_xfer(0, (tusb_control_request_t *)req, &min, 2);
-                case UAC1_REQ_GET_MAX: return tud_control_xfer(0, (tusb_control_request_t *)req, &max, 2);
-                case UAC1_REQ_GET_RES: return tud_control_xfer(0, (tusb_control_request_t *)req, &res, 2);
+    if (recip == UAC1_RECIPIENT_INTERFACE) {
+        uint8_t const entity_id = tu_u16_high(req->wIndex);
+
+        if (entity_id == UAC1_FEATURE_UNIT_ID && cn == 0) {
+            if (cs == AUDIO_FU_CTRL_MUTE) {
+                static uint8_t v = 0;
+                return tud_control_xfer(0, (tusb_control_request_t *)req, &v, 1);
+            }
+            if (cs == AUDIO_FU_CTRL_VOLUME) {
+                static int16_t cur = 0, min = -90 * 256, max = 0, res = 256;
+                switch (req->bRequest) {
+                    case UAC1_REQ_GET_CUR: return tud_control_xfer(0, (tusb_control_request_t *)req, &cur, 2);
+                    case UAC1_REQ_GET_MIN: return tud_control_xfer(0, (tusb_control_request_t *)req, &min, 2);
+                    case UAC1_REQ_GET_MAX: return tud_control_xfer(0, (tusb_control_request_t *)req, &max, 2);
+                    case UAC1_REQ_GET_RES: return tud_control_xfer(0, (tusb_control_request_t *)req, &res, 2);
+                }
             }
         }
-    }
-
-    /* Sample-frequency control on the EP. Only one rate (48 kHz). */
-    if (cs == AUDIO_CS_CTRL_SAM_FREQ && req->bRequest == UAC1_REQ_GET_CUR) {
-        static uint8_t freq[3] = {
-            (AUDIO_SAMPLE_RATE)       & 0xFF,
-            (AUDIO_SAMPLE_RATE >>  8) & 0xFF,
-            (AUDIO_SAMPLE_RATE >> 16) & 0xFF,
-        };
-        return tud_control_xfer(0, (tusb_control_request_t *)req, freq, 3);
+    } else if (recip == UAC1_RECIPIENT_ENDPOINT) {
+        /* Sample-frequency control on the EP. Only one rate (48 kHz). */
+        if (cs == AUDIO_CS_CTRL_SAM_FREQ && req->bRequest == UAC1_REQ_GET_CUR) {
+            static uint8_t freq[3] = {
+                (AUDIO_SAMPLE_RATE)       & 0xFF,
+                (AUDIO_SAMPLE_RATE >>  8) & 0xFF,
+                (AUDIO_SAMPLE_RATE >> 16) & 0xFF,
+            };
+            return tud_control_xfer(0, (tusb_control_request_t *)req, freq, 3);
+        }
     }
 
     return false;
@@ -170,8 +203,11 @@ static bool handle_get_request(uint8_t stage, tusb_control_request_t const *req)
 static bool handle_set_request(uint8_t stage, tusb_control_request_t const *req) {
     /* SETUP — record what to expect and accept the data stage */
     if (stage == CONTROL_STAGE_SETUP) {
+        uint8_t const recip = req->bmRequestType & 0x1F;
         uac1.pending_cs        = tu_u16_high(req->wValue);
-        uac1.pending_recipient = tu_u16_low (req->wIndex);
+        uac1.pending_recipient = (recip == UAC1_RECIPIENT_INTERFACE)
+                                 ? tu_u16_high(req->wIndex)   /* entity ID */
+                                 : tu_u16_low (req->wIndex);  /* EP addr   */
         uac1.pending_len       = (uint8_t)req->wLength;
         if (uac1.pending_len > sizeof(uac1_ctrl_buf)) return false;
         return tud_control_xfer(0, (tusb_control_request_t *)req,
@@ -184,79 +220,139 @@ static bool handle_set_request(uint8_t stage, tusb_control_request_t const *req)
     return true;
 }
 
-static bool uac1_control_xfer_cb(uint8_t rhport, uint8_t stage,
-                                 tusb_control_request_t const *req) {
-    (void)rhport;
+/* Apply an AS-interface alt change.
+ *
+ * dwc2-specific protocol (see tinyusb/src/class/audio/audio_device.c):
+ * the FIFO allocation is done ONCE in driver_open() via
+ * usbd_edpt_iso_alloc(); subsequent alt changes use
+ * usbd_edpt_iso_activate() to bring the EP up, and on alt 0 we simply
+ * stop arming transfers — we do NOT call usbd_edpt_close(), because
+ * close() releases controller-level state (including the ISO frame-
+ * parity counter) and a re-open lands on the wrong parity, triggering
+ * IISOIXFR retries until iso_retry exhausts and the EP is silently
+ * disabled. That manifests as "device works on auto-select but
+ * disappears after switching away and back."
+ *
+ * Idempotent SET_INTERFACE(alt = current_alt) is common from host
+ * driver probes; bail early so we don't tear down a healthy stream. */
+static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
+    if (alt == uac1.cur_alt) return true;
+    uac1.cur_alt = alt;
 
-    /* Standard SET_INTERFACE on the AS interface — open/close EPs. */
-    if (req->bmRequestType == 0x01 /* dir=H2D, type=std, recip=interface */
-        && req->bRequest    == TUSB_REQ_SET_INTERFACE
-        && (req->wIndex & 0xFF) == ITF_NUM_AS) {
-        if (stage != CONTROL_STAGE_SETUP) return true;
-
-        uint8_t const alt = (uint8_t)req->wValue;
-        uac1.cur_alt = alt;
-
-        if (alt == 0) {
-            /* Zero-bandwidth — close any open EPs */
-            if (uac1.ep_data_open) usbd_edpt_close(0, AUDIO_OUT_ENDPOINT);
-            if (uac1.ep_fb_open)   usbd_edpt_close(0, AUDIO_FB_ENDPOINT);
-            uac1.ep_data_open = false;
-            uac1.ep_fb_open   = false;
-            audio_streaming = false;
-        } else if (alt == 1) {
-            /* Open EPs from descriptor records — find them by walking
-             * the configuration descriptor we already gave the host.
-             * For simplicity we hardcode the EP attributes since we
-             * own them. */
-            /* Build ad-hoc endpoint descriptors for usbd_edpt_open. The
-             * bitfield layout in tusb_desc_endpoint_t.bmAttributes is
-             * .xfer:2 / .sync:2 / .usage:2 / reserved:2 — see
-             * tusb_types.h. We mirror the wire-format bytes from the
-             * config descriptor at offsets 102 and 118: 0x05 and 0x11. */
-            tusb_desc_endpoint_t ep_out = {
-                .bLength          = sizeof(tusb_desc_endpoint_t),
-                .bDescriptorType  = TUSB_DESC_ENDPOINT,
-                .bEndpointAddress = AUDIO_OUT_ENDPOINT,
-                .bmAttributes     = {.xfer = TUSB_XFER_ISOCHRONOUS,
-                                     .sync = 1, /* asynchronous */
-                                     .usage = 0 /* data endpoint */},
-                .wMaxPacketSize   = AUDIO_EP_MAX_PKT,
-                .bInterval        = 1,
-            };
-            tusb_desc_endpoint_t ep_fb = {
-                .bLength          = sizeof(tusb_desc_endpoint_t),
-                .bDescriptorType  = TUSB_DESC_ENDPOINT,
-                .bEndpointAddress = AUDIO_FB_ENDPOINT,
-                .bmAttributes     = {.xfer = TUSB_XFER_ISOCHRONOUS,
-                                     .sync = 0, /* no sync */
-                                     .usage = 1 /* feedback */},
-                .wMaxPacketSize   = 4,
-                .bInterval        = 1,
-            };
-            uac1.ep_data_open = usbd_edpt_open(0, &ep_out);
-            uac1.ep_fb_open   = usbd_edpt_open(0, &ep_fb);
-
-            if (uac1.ep_data_open) {
-                usbd_edpt_xfer(0, AUDIO_OUT_ENDPOINT, audio_out_buf, AUDIO_EP_MAX_PKT);
-            }
-            if (uac1.ep_fb_open) {
-                usbd_edpt_xfer(0, AUDIO_FB_ENDPOINT, audio_fb_buf, 4);
-            }
-            audio_streaming = true;
-        }
-        tud_control_status(rhport, req);
+    if (alt == 0) {
+        /* No close. Just stop the data flow; the next alt-1 reactivates
+         * the same dwc2 EP without losing frame-parity sync. */
+        uac1.ep_data_open = false;
+        uac1.ep_fb_open   = false;
+        audio_streaming = false;
         return true;
     }
 
-    /* Class requests — feature-unit and EP controls */
-    if (TUSB_REQ_TYPE_CLASS == req->bmRequestType_bit.type) {
-        bool const is_get = (req->bmRequestType & 0x80) != 0;
-        if (is_get) return handle_get_request(stage, req);
-        return handle_set_request(stage, req);
+    if (alt == 1) {
+        /* The bmAttributes bitfield layout is .xfer:2 / .sync:2 / .usage:2
+         * — values mirror the wire-format bytes 0x05 (data) and 0x11 (FB)
+         * from the config descriptor. */
+        tusb_desc_endpoint_t ep_out = {
+            .bLength          = sizeof(tusb_desc_endpoint_t),
+            .bDescriptorType  = TUSB_DESC_ENDPOINT,
+            .bEndpointAddress = AUDIO_OUT_ENDPOINT,
+            .bmAttributes     = {.xfer = TUSB_XFER_ISOCHRONOUS,
+                                 .sync = 1, .usage = 0},
+            .wMaxPacketSize   = AUDIO_EP_MAX_PKT,
+            .bInterval        = 1,
+        };
+        tusb_desc_endpoint_t ep_fb = {
+            .bLength          = sizeof(tusb_desc_endpoint_t),
+            .bDescriptorType  = TUSB_DESC_ENDPOINT,
+            .bEndpointAddress = AUDIO_FB_ENDPOINT,
+            .bmAttributes     = {.xfer = TUSB_XFER_ISOCHRONOUS,
+                                 .sync = 0, .usage = 1},
+            .wMaxPacketSize   = 3,
+            .bInterval        = 1,
+        };
+        uac1.ep_data_open = usbd_edpt_iso_activate(rhport, &ep_out);
+        uac1.ep_fb_open   = usbd_edpt_iso_activate(rhport, &ep_fb);
+
+        /* Clear any stale halt state from a previous activation cycle —
+         * the audio_device.c TODO note in upstream TinyUSB calls this a
+         * workaround for an ep_close() omission, but we need it for the
+         * activate() path too on dwc2. */
+        usbd_edpt_clear_stall(rhport, AUDIO_OUT_ENDPOINT);
+        usbd_edpt_clear_stall(rhport, AUDIO_FB_ENDPOINT);
+
+        if (uac1.ep_data_open) {
+            usbd_edpt_xfer(rhport, AUDIO_OUT_ENDPOINT, audio_out_buf, AUDIO_EP_MAX_PKT);
+        }
+        /* Feedback EP is armed on the very next SOF (uac1_sof). Arming
+         * it here would land on a frame the dwc2 controller hasn't
+         * scheduled an IN token for yet, defeating the SOF timing fix. */
+        audio_streaming = true;
+        return true;
     }
 
     return false;
+}
+
+static bool uac1_control_xfer_cb(uint8_t rhport, uint8_t stage,
+                                 tusb_control_request_t const *req) {
+    if (stage == CONTROL_STAGE_SETUP) {
+        /* ---- Standard requests on our interfaces ----
+         *
+         * Custom class drivers must answer GET_INTERFACE and SET_INTERFACE
+         * for every interface they own. macOS aggressively probes both
+         * after the user picks the device as output — STALLing either
+         * causes Core Audio to un-route audio (while leaving the USB
+         * session alive, so tud_mounted() stays true and the LED keeps
+         * blinking). Earlier draft only handled SET_INTERFACE on AS and
+         * silently STALLed everything else; macOS dropped the device
+         * from the active output list a few seconds in.
+         */
+        if (req->bmRequestType_bit.type == TUSB_REQ_TYPE_STANDARD) {
+            uint8_t const itf = (uint8_t)tu_u16_low(req->wIndex);
+
+            if (req->bRequest == TUSB_REQ_SET_INTERFACE) {
+                uint8_t const alt = (uint8_t)req->wValue;
+                if (itf == ITF_NUM_AC) {
+                    /* AC has only alt 0 */
+                    if (alt != 0) return false;
+                    return tud_control_status(rhport, (tusb_control_request_t *)req);
+                }
+                if (itf == ITF_NUM_AS) {
+                    if (!uac1_apply_alt(rhport, alt)) return false;
+                    return tud_control_status(rhport, (tusb_control_request_t *)req);
+                }
+                return false;
+            }
+
+            if (req->bRequest == TUSB_REQ_GET_INTERFACE) {
+                static uint8_t alt_resp;
+                if      (itf == ITF_NUM_AC) alt_resp = 0;
+                else if (itf == ITF_NUM_AS) alt_resp = uac1.cur_alt;
+                else                        return false;
+                return tud_control_xfer(rhport, (tusb_control_request_t *)req,
+                                        &alt_resp, 1);
+            }
+
+            return false;
+        }
+
+        /* ---- Class requests on our interfaces / endpoints ---- */
+        if (req->bmRequestType_bit.type == TUSB_REQ_TYPE_CLASS) {
+            bool const is_get = (req->bmRequestType & 0x80) != 0;
+            if (is_get) return handle_get_request(stage, req);
+            return handle_set_request(stage, req);
+        }
+
+        return false;
+    }
+
+    /* Pass DATA / ACK stages through to the same per-direction handlers
+     * for SET requests that need to consume their data payload. */
+    if (req->bmRequestType_bit.type == TUSB_REQ_TYPE_CLASS) {
+        bool const is_get = (req->bmRequestType & 0x80) != 0;
+        if (!is_get) return handle_set_request(stage, req);
+    }
+    return true;
 }
 
 /* ---------------- Endpoint transfer completions ---------------- */
@@ -275,19 +371,34 @@ static bool uac1_xfer_cb(uint8_t rhport, uint8_t ep_addr,
     }
 
     if (ep_addr == AUDIO_FB_ENDPOINT) {
-        /* Re-arm with the same fixed nominal value. M4+ updates
-         * audio_fb_buf from a SOF-driven PID. */
-        usbd_edpt_xfer(0, AUDIO_FB_ENDPOINT, audio_fb_buf, 4);
+        /* Do NOT re-arm here. The dwc2 ISO IN feedback path needs the
+         * next packet armed via the SOF interrupt path (which sets the
+         * SEVNFRM/SODDFRM frame-parity bits in DIEPCTL correctly).
+         * Re-arming from xfer_cb lands on the wrong parity, triggers
+         * IISOIXFR retries, and after iso_retry exhaustion the dwc2
+         * driver disables the endpoint silently — at which point macOS
+         * stops seeing feedback responses, waits ~30 s, then suspends
+         * the device. That was the M3+M4 "disappears after 15-50 s"
+         * symptom. The arming happens in uac1_sof() below. */
         return true;
     }
 
     return false;
 }
 
-/* SOF — empty for M3. M4+ will stamp the host's frame counter into the
- * feedback PID and call the audio pipeline. */
+/* SOF callback — fires once per USB frame (1 ms on FS). dwc2 sets up the
+ * next ISO IN packet from this context with correct frame-parity bits.
+ * `usbd_edpt_busy` guards against double-arming when a previous transfer
+ * is still in flight. M5+ will replace the static feedback value with a
+ * SOF-driven PID controller that trims the device's audio clock to the
+ * host's. */
 static void uac1_sof(uint8_t rhport, uint32_t frame_count) {
-    (void)rhport; (void)frame_count;
+    (void)frame_count;
+    if (uac1.cur_alt != 1) return;
+    if (!uac1.ep_fb_open)  return;
+    if (usbd_edpt_busy(rhport, AUDIO_FB_ENDPOINT)) return;
+
+    usbd_edpt_xfer(rhport, AUDIO_FB_ENDPOINT, audio_fb_buf, 3);
 }
 
 /* ====================================================================== */

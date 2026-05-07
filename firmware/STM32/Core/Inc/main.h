@@ -41,4 +41,22 @@ void USB_HW_Init(void);    /* clocks, GPIO, voltage detector, NVIC */
 void USB_App_Init(void);   /* tud_init(0) */
 void USB_Task(void);       /* tud_task() — call from main loop */
 
+/* M4 audio output (SAI1_A) — see audio_out.c
+ *
+ * Pin map per Documentation/Porting/STM32H723_first_steps.md §0.4:
+ *   SAI1_MCLK_A: PE2  (12.288 MHz, 256×Fs)
+ *   SAI1_FS_A  : PE4  (LRCLK, 48 kHz)
+ *   SAI1_SCK_A : PE5  (BCK, 3.072 MHz)
+ *   SAI1_SD_A  : PE6  (DATA, MSB-aligned 24-bit in 32-bit slots)
+ *
+ * All four pins use AF6 (SAI1) on Port E. None of them are usable on this
+ * board until camera + OSPI flash are unpopulated/uninitialised — both
+ * are off in our build.
+ */
+void Audio_Init(void);
+void Audio_Start(void);
+extern volatile uint32_t audio_dma_callbacks;   /* increments on each
+                                                   half/cplt — proves the
+                                                   DMA pipeline is alive */
+
 #endif

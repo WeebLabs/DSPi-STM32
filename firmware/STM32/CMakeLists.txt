@@ -20,7 +20,7 @@ project(DSPi_stm32h723 C ASM)
 # Find CMSIS device + HAL drivers we need for M0 (audio peripherals come later)
 find_package(CMSIS COMPONENTS STM32H723VG_M7 REQUIRED)
 find_package(HAL   COMPONENTS STM32H7_M7
-                              RCC GPIO CORTEX PWR FLASH UART DMA
+                              RCC GPIO CORTEX PWR FLASH UART DMA SAI
                    REQUIRED)
 
 set(EXE DSPi_stm32h723)
@@ -38,6 +38,7 @@ add_executable(${EXE}
     Core/Src/usb_descriptors.c
     Core/Src/usb_glue.c
     Core/Src/usb_audio.c
+    Core/Src/audio_out.c
     # TinyUSB sources — kept as an explicit list so the milestone scope is
     # obvious. M3: device stack + dwc2 only — no built-in class drivers
     # (UAC1 is registered through usbd_app_driver_get_cb() in usb_audio.c).
@@ -77,6 +78,7 @@ target_link_libraries(${EXE} PRIVATE
     HAL::STM32::H7::M7::FLASHEx
     HAL::STM32::H7::M7::UART
     HAL::STM32::H7::M7::DMA
+    HAL::STM32::H7::M7::SAI
     CMSIS::STM32::H723VG::M7
     STM32::NoSys
 )

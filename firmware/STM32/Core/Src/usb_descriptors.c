@@ -50,9 +50,12 @@ static tusb_desc_device_t const desc_device = {
     .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
     .bDeviceProtocol    = MISC_PROTOCOL_IAD,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
-    .idVendor           = 0xCAFE,
-    .idProduct          = 0x4002,    /* +1 from the M2 vendor PID for clarity */
-    .bcdDevice          = 0x0001,
+    /* Match the original RP DSPi project (firmware/DSPi/usb_descriptors.h)
+     * so host-side tooling that already keys off these IDs works against
+     * the STM32 build unchanged. */
+    .idVendor           = 0x2E8B,
+    .idProduct          = 0xFEAA,
+    .bcdDevice          = 0x0201,
     .iManufacturer      = STRID_MANUFACTURER,
     .iProduct           = STRID_PRODUCT,
     .iSerialNumber      = STRID_SERIAL,
@@ -180,18 +183,29 @@ static uint8_t const desc_configuration[CONFIG_TOTAL_LEN] = {
     0,                        /* bRefresh — required field, ignored for data EP */
     AUDIO_FB_ENDPOINT,        /* bSynchAddress — points to feedback EP */
 
-    /* ---- 111: CS iso data EP (no special freq/pitch controls for M3) ---- */
+    /* ---- 111: CS iso data EP — declares sampling-frequency control ----
+     * macOS treats this byte as the discovery hint for the device's
+     * sample-rate query path. With bmAttributes=0 ("no controls"),
+     * Core Audio binds the format briefly on SET_INTERFACE alt 1 then
+     * gives up a few seconds in. bit 0 = sampling-frequency control;
+     * the actual GET_CUR/SAM_FREQ handler is in usb_audio.c. */
     7, TUSB_DESC_CS_ENDPOINT,
     AUDIO_CS_EP_SUBTYPE_GENERAL,
-    0,                        /* bmAttributes — no MaxPacketsOnly, no controls */
+    0x01,                     /* bmAttributes: sampling-frequency control */
     0,                        /* bLockDelayUnits */
     U16_LE(0),                /* wLockDelay */
 
-    /* ---- 118: Std iso feedback EP IN (3 bytes, 1 ms) ---- */
+    /* ---- 118: Std iso feedback EP IN (3 bytes, 1 ms) ----
+     * UAC1 spec mandates 10.14 fixed-point in exactly 3 bytes for FS.
+     * macOS enumerates either way but rejects the stream on alt 1
+     * unless wMaxPacketSize == 3. The dwc2 ISO FIFO is still
+     * allocated in 4-byte words (one 32-bit slot) — see the
+     * usbd_edpt_iso_alloc(rhport, AUDIO_FB_ENDPOINT, 4) in
+     * usb_audio.c::uac1_open. */
     9, TUSB_DESC_ENDPOINT,
     AUDIO_FB_ENDPOINT,
     0x11,                     /* bmAttributes: ISO (0x01) + no-sync (0x00) + explicit-FB (0x10) */
-    U16_LE(4),                /* wMaxPacketSize — DCD requires 4-byte iso alloc */
+    U16_LE(3),                /* wMaxPacketSize: 3 bytes per UAC1 FS feedback */
     1,                        /* bInterval (1 ms) */
     2,                        /* bRefresh — host polls every 2^2 ms */
     0,                        /* bSynchAddress */
@@ -208,11 +222,15 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
 
 static char const *const string_table[] = {
     [STRID_LANGID]           = NULL,
-    [STRID_MANUFACTURER]     = "Weeb Labs",
-    [STRID_PRODUCT]          = "DSPi STM32H723",
+    [STRID_MANUFACTURER]     = "GitHub.com/WeebLabs",
+    [STRID_PRODUCT]          = "Weeb Labs DSPi for STM32",
     [STRID_SERIAL]           = "0001",
-    [STRID_AC_INTERFACE]     = "DSPi Control",
-    [STRID_AS_INTERFACE]     = "DSPi Stream",
+    /* macOS Core Audio surfaces the AS-interface string as the device
+     * name in Audio MIDI Setup, NOT the device-level iProduct. Match
+     * iProduct so the Sound Output list shows the device by its real
+     * product name. */
+    [STRID_AC_INTERFACE]     = "Weeb Labs DSPi for STM32",
+    [STRID_AS_INTERFACE]     = "Weeb Labs DSPi for STM32",
     [STRID_INPUT_TERMINAL]   = "USB Stream",
     [STRID_OUTPUT_TERMINAL]  = "Speaker",
 };

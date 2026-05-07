@@ -23,6 +23,7 @@ extern "C" {
 #define HAL_HSEM_MODULE_ENABLED
 #define HAL_PWR_MODULE_ENABLED
 #define HAL_RCC_MODULE_ENABLED
+#define HAL_SAI_MODULE_ENABLED
 #define HAL_UART_MODULE_ENABLED
 
 /* The following modules will be re-enabled when their milestone arrives.
@@ -94,6 +95,9 @@ extern "C" {
 #endif
 #ifdef HAL_UART_MODULE_ENABLED
   #include "stm32h7xx_hal_uart.h"
+#endif
+#ifdef HAL_SAI_MODULE_ENABLED
+  #include "stm32h7xx_hal_sai.h"
 #endif
 
 #ifdef USE_FULL_ASSERT

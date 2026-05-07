@@ -55,15 +55,19 @@ int main(void) {
     USB_HW_Init();    /* GPIO + USB peripheral clock + voltage detector + NVIC */
     USB_App_Init();   /* tud_init(0) — TinyUSB device stack */
 
+    Audio_Init();     /* SAI1_A + DMA1_Stream0 + sine table fill */
+    Audio_Start();    /* kick off circular DMA — 1 kHz tone on PE6 SD */
+
     printf("\r\n");
-    printf("=== DSPi STM32H723 — M3 UAC1 OUT silence consumer ===\r\n");
+    printf("=== DSPi STM32H723 — M4 SAI1_A 1 kHz tone ===\r\n");
     printf("  SYSCLK    = %lu Hz\r\n", (unsigned long)HAL_RCC_GetSysClockFreq());
     printf("  HCLK      = %lu Hz\r\n", (unsigned long)HAL_RCC_GetHCLKFreq());
-    printf("  PCLK1     = %lu Hz\r\n", (unsigned long)HAL_RCC_GetPCLK1Freq());
-    printf("  PCLK2     = %lu Hz\r\n", (unsigned long)HAL_RCC_GetPCLK2Freq());
     printf("  HSE       = %lu Hz (board crystal)\r\n", (unsigned long)HSE_VALUE);
-    printf("  USB FS    = PLL3Q -> 48 MHz (UAC1 device, VID 0xCAFE PID 0x4002)\r\n");
-    printf("  Audio     = 48 kHz / 16-bit / stereo, ISO OUT 0x01, FB IN 0x82\r\n");
+    printf("  USB FS    = PLL3Q -> 48 MHz (UAC1, VID 0xCAFE PID 0x4002)\r\n");
+    printf("  SAI kclk  = %lu Hz (PLL2_P)\r\n",
+           (unsigned long)HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SAI1));
+    printf("  Audio out = SAI1_A I2S Philips 24-bit, MCLK PE2 / FS PE4 / SCK PE5 / SD PE6\r\n");
+    printf("  Tone      = 48-sample sine -> 1.000 kHz at -12 dBFS\r\n");
     printf("  Heartbeat LED on PE3 (1 Hz idle / 4 Hz mounted / 10 Hz lost)\r\n");
 
     /* Main loop runs the USB task continuously and toggles the heartbeat
@@ -75,9 +79,19 @@ int main(void) {
      *   1 Hz   = idle (USB device stack alive, host hasn't enumerated)
      *   4 Hz   = mounted (host completed SetConfiguration)
      *  10 Hz   = was mounted, then unmounted — host disconnected/suspended
+     *
+     * NOTE: the periodic printf that lived inside the blink loop was a
+     * latent bug. At 115200 baud a ~70-char status line takes ~6 ms of
+     * blocking HAL_UART_Transmit. During that window tud_task() doesn't
+     * run, ISO OUT/feedback transfer completions queue up, and the host
+     * eventually decides the device is unhealthy and USB-suspends it.
+     * Symptom seen at M3+M4 testing: device enumerated and streamed
+     * audio for ~50 seconds, then dropped from system_profiler entirely
+     * while the firmware-side LED kept reporting "mounted." Removing
+     * the printf restored stable streaming. M5+ either uses an
+     * IRQ-driven UART DMA path or a non-blocking ring buffer.
      */
     uint32_t last_blink_ms = 0;
-    uint32_t tick = 0;
     bool was_ever_mounted = false;
     for (;;) {
         USB_Task();
@@ -90,16 +104,6 @@ int main(void) {
         if (now - last_blink_ms >= blink_period) {
             last_blink_ms = now;
             HAL_GPIO_TogglePin(HEARTBEAT_LED_PORT, HEARTBEAT_LED_PIN);
-            if ((tick & 0x07) == 0) {
-                printf("tick %lu  uptime=%lu ms  usb=%s  audio=%s pkts=%lu bytes=%lu\r\n",
-                       (unsigned long)tick,
-                       (unsigned long)now,
-                       mounted ? "mounted" : (was_ever_mounted ? "lost" : "idle"),
-                       audio_streaming ? "streaming" : "idle",
-                       (unsigned long)audio_packets_received,
-                       (unsigned long)audio_bytes_received);
-            }
-            tick++;
         }
     }
 }
@@ -149,7 +153,8 @@ static void SystemClock_Config(void) {
 
     /* PLL2 — audio kernel clock 49.15223 MHz (FRACN). Section 0.5. */
     periph.PeriphClockSelection = RCC_PERIPHCLK_USART1
-                                | RCC_PERIPHCLK_USB;
+                                | RCC_PERIPHCLK_USB
+                                | RCC_PERIPHCLK_SAI1;
     /* PLL2 — audio kernel clock 49.151978 MHz */
     periph.PLL2.PLL2M = 5;        /* 25/5 = 5 MHz VCO input */
     periph.PLL2.PLL2N = 98;
@@ -176,6 +181,7 @@ static void SystemClock_Config(void) {
 
     periph.Usart16ClockSelection = RCC_USART16CLKSOURCE_D2PCLK2;
     periph.UsbClockSelection     = RCC_USBCLKSOURCE_PLL3;
+    periph.Sai1ClockSelection    = RCC_SAI1CLKSOURCE_PLL2;
     if (HAL_RCCEx_PeriphCLKConfig(&periph) != HAL_OK) Error_Handler();
 }
 
