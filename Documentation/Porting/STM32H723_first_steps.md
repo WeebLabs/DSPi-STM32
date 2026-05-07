@@ -11,6 +11,92 @@ Verdict: go. The project is well-suited to this port. Proceed with the monorepo 
 
 ---
 
+## 0. Board-Specific Confirmations — WeAct MiniSTM32H723 V1.2
+
+*Added 2026-05-07 after inspecting the schematic, BOM, and example projects in [WeActStudio.MiniSTM32H723](https://github.com/WeActStudio/WeActStudio.MiniSTM32H723). These confirmations override the generic guidance in Sections 2, 3, and 14 where they conflict.*
+
+### 0.1 Board: confirmed WeAct MiniSTM32H723 V1.2
+
+LQFP100, USB-C, **on-board SWD header (P3): 3V3 / SWDIO=PA13 / SWCLK=PA14 / GND**, 2×22 pin headers (P1, P2), no on-board ST-LINK. Additional onboard parts: 8 MB SPI flash (W25Q64 on SPI3), 8 MB OSPI flash (W25Q64), MicroSD socket (SDMMC1), removable ST7735 TFT, removable camera FPC, blue user LED on PE3 via PNP, BOOT0/NRST/K1 buttons.
+
+### 0.2 HSE crystal: confirmed **25 MHz**
+
+Verified three ways: schematic X1 silkscreen "25Mhz", WeAct example `.ioc` declares `VCOInput1Freq_Value=12500000` (= 25 MHz / DIVM=2), and example `main.c` SystemClock_Config uses `PLLM=2, PLLN=44, PLLP=1` (25/2 × 44 = 550 MHz SYSCLK). Crystal load caps are 10 pF (C1, C3). LSE 32.768 kHz also populated on PC14/PC15 with 7 pF caps — RTC available.
+
+### 0.3 USB DFU: confirmed available
+
+USB-C J1 → PA11/PA12 → STM32H7 internal USB FS PHY → System Memory bootloader at `0x1FF09800`. Entry: hold BOOT0, press+release NRST, release BOOT0 ~0.5 s later. macOS flashing options: `dfu-util` (open source, `brew install dfu-util`) or STM32CubeProgrammer. **DFU is sufficient for flashing — no debug probe required for M0.** SWD probe still recommended for runtime debugging (RTT, breakpoints) — a $10 ST-LINK V2 clone or Raspberry Pi Debug Probe via SWDIO/SWCLK header is the minimum cost-effective option.
+
+### 0.4 Pin assignment for DSPi audio (LQFP100 + remove unneeded onboard peripherals)
+
+The full DSPi feature set fits if camera/TFT are not installed and the OSPI flash is not initialized. The required sacrifices:
+
+| Sacrifice | Cost | Justification |
+|---|---|---|
+| Don't populate camera FPC | None (not installed by default) | Frees DCMI pins consumed by SAI1_A bus, SAI2_MCLK_A, SPDIFRX alternate |
+| Don't populate TFT | None (not installed by default) | Frees PE10–PE14 (SAI2_B alternate, SPI2 alternate) |
+| Don't init OSPI flash | Lose 8 MB OSPI; keep 8 MB SPI flash for presets (the plan already preferred SPI flash + LittleFS — Section 10) | Frees SAI1_MCLK_A (PE2) and SAI2_A bus (PD11/12/13) |
+| Repurpose PE3 (BLUE_LED) for SAI1_SD_B | Lose status LED — wire one to any free header pin | PE3 is the **only** LQFP100 pin for SAI1_SD_B; no alternative |
+| Don't use SDMMC1 | Lose SD card | Optional — keep if FW dump/load via SD is desired |
+
+**Confirmed pin assignment for the DSPi port:**
+
+| Function | Pin | Notes |
+|---|---|---|
+| USB-C D+/D− | PA11 / PA12 | Hard-wired |
+| SWD | PA13 / PA14 | Header P3 |
+| SAI1_MCLK_A | PE2 | Was OSPI_BK1_IO2 |
+| SAI1_SCK_A | PE5 | Was DCMI_D6 |
+| SAI1_FS_A | PE4 | Was DCMI_D4 |
+| SAI1_SD_A | PE6 | Was DCMI_D7 — **first audio output (master clocks here)** |
+| SAI1_SD_B | PE3 | Was BLUE_LED — **second audio output, internal slave to SAI1_A** |
+| SAI2_MCLK_A | PE0 | Was DCMI_D2 (SAI2 clock generator; or sync to SAI1 via GCR) |
+| SAI2_SCK_A | PD13 | Was OSPI_BK1_IO3 |
+| SAI2_FS_A | PD12 | Was OSPI_BK1_IO1 |
+| SAI2_SD_A | PD11 | Was OSPI_BK1_IO0 — **third audio output** |
+| SAI2_SD_B | PA0 | Free header pin — **fourth audio output, internal slave to SAI2_A** |
+| SPDIFRX_IN3 | PD8 | Free header pin (alt: PB7 if camera not installed) |
+| SPI2_SCK (PDM CLK) | PB13 | Free |
+| SPI2_MOSI (PDM data) | PB15 | Free |
+| I2C target SCL/SDA | PB10 / PB11 | I2C2 — both free header pins |
+| W25Q64 SPI flash (preset store) | PB3 / PB4 / PD7 / PD6 | SPI3, on-board |
+| Status LED | choose any free pin from header | Wire externally |
+| K1 user button | PC13 | On-board |
+
+Result: **4 sample-aligned stereo audio outputs + SPDIFRX in + PDM out + USB + I2C target + 8 MB external flash**. Same channel count as RP2350.
+
+### 0.5 PLL plan refined for 25 MHz HSE
+
+The Section 3 plan offered a 55 ppm fractional-N solution. Better numbers using all 13 bits of FRACN:
+
+```
+PLL1 (SYSCLK = 550 MHz):
+  DIVM1 = 2, DIVN1 = 44, DIVP1 = 1, FRACN = 0
+  VCO = 25/2 × 44 = 550 MHz   →  P = 550 MHz   (matches WeAct examples)
+
+PLL2 (SAI kernel = 49.152 MHz):
+  DIVM2 = 5, DIVN2 = 19, FRACN = 5414, DIVP2 = 2
+  VCO = 25/5 × (19 + 5414/8192) = 5 × 19.66089 = 98.30445 MHz
+  P   = VCO / 2 = 49.15223 MHz   →  +4.7 ppm error  (vs target 49.152 MHz)
+
+USB FS = 48 MHz:
+  HSI48 + CRS locked to USB SOF — better than ±0.25%, no PLL needed
+```
+
+PLL3 left free for future use (e.g., dedicated 44.1 kHz family clock if you decide to add that path later instead of relying on ASRC).
+
+4.7 ppm is within IEC 60958 class I (±100 ppm) and trivially within any DAC's PLL pull range. The Section 3 conclusion (use 24.576 MHz HSE) is no longer relevant — we have the board, the crystal is 25 MHz, and FRACN gets us close enough to be inaudible.
+
+### 0.6 M0 milestone updated for this board
+
+Skip the J-Link purchase initially. Bring-up sequence:
+1. Flash via DFU: hold BOOT0, tap NRST, release BOOT0 → `dfu-util -a 0 -s 0x08000000 -D firmware.bin`
+2. UART stdio over USART1 (PA9 TX / PA10 RX) — header pins, USB-serial cable required
+3. K1 (PC13) for user input, drive any free header pin for status LED
+4. Add SWD probe (ST-LINK V2 clone $10) when you need breakpoints + RTT — wire to header P3
+
+---
+
 ## 1. Toolchain and Build
 
 ### Recommendation: hand-written CMake + ObKo/stm32-cmake + direct STM32CubeH7 submodule
