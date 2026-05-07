@@ -3,15 +3,21 @@
 
 #include <stdint.h>
 
-/* TinyUSB calls these by name when the host issues GET_DESCRIPTOR.
- * Implementation is in usb_descriptors.c. */
-uint8_t const *tud_descriptor_device_cb(void);
-uint8_t const *tud_descriptor_configuration_cb(uint8_t index);
+/* TinyUSB descriptor callbacks (implemented in usb_descriptors.c). */
+uint8_t  const *tud_descriptor_device_cb(void);
+uint8_t  const *tud_descriptor_configuration_cb(uint8_t index);
 uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid);
 
-/* M2 endpoint addresses (vendor class echo). EP numbers are arbitrary;
- * 0x01 OUT and 0x81 IN are the conventional lowest non-control endpoints. */
-#define VENDOR_EP_OUT   0x01
-#define VENDOR_EP_IN    0x81
+/* String table indices — must stay in sync with usb_descriptors.c */
+enum {
+    STRID_LANGID = 0,
+    STRID_MANUFACTURER,
+    STRID_PRODUCT,
+    STRID_SERIAL,
+    STRID_AC_INTERFACE,
+    STRID_AS_INTERFACE,
+    STRID_INPUT_TERMINAL,
+    STRID_OUTPUT_TERMINAL,
+};
 
 #endif

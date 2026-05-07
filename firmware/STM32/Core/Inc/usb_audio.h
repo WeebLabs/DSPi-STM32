@@ -1,0 +1,45 @@
+/**
+ * usb_audio.h — DSPi STM32H723 UAC1 OUT (M3 silence consumer)
+ *
+ * Constants shared between usb_audio.c (custom UAC1 class driver) and
+ * usb_descriptors.c. Mirrors the conventions used by firmware/DSPi/
+ * usb_audio.c so future milestones can rebase without renaming things.
+ */
+
+#ifndef DSPI_STM32_USB_AUDIO_H
+#define DSPI_STM32_USB_AUDIO_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+/* ---- Endpoint addresses ---- */
+#define AUDIO_OUT_ENDPOINT      0x01    /* ISO OUT, host -> device */
+#define AUDIO_FB_ENDPOINT       0x82    /* ISO IN feedback, async sync */
+
+/* ---- Sample format ---- */
+#define AUDIO_SAMPLE_RATE       48000U
+#define AUDIO_CHANNELS          2
+#define AUDIO_BIT_DEPTH         16U
+#define AUDIO_BYTES_PER_SAMPLE  (AUDIO_BIT_DEPTH / 8)
+#define AUDIO_BYTES_PER_FRAME   (AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE)
+
+/* Max payload per 1 ms USB FS frame, including +1 jitter sample.
+ * 48 nominal + 1 jitter = 49 frames * 4 B = 196 bytes. Round up. */
+#define AUDIO_EP_MAX_PKT        200U
+
+/* UAC1 entity IDs (arbitrary, distinct, non-zero) */
+#define UAC1_INPUT_TERMINAL_ID  0x01
+#define UAC1_FEATURE_UNIT_ID    0x02
+#define UAC1_OUTPUT_TERMINAL_ID 0x03
+
+/* Interface numbering — order is what the descriptor declares them */
+#define ITF_NUM_AC              0   /* AudioControl */
+#define ITF_NUM_AS              1   /* AudioStreaming */
+#define ITF_NUM_TOTAL           2
+
+/* M3 stats — exposed for the heartbeat printf. */
+extern volatile uint32_t audio_bytes_received;
+extern volatile uint32_t audio_packets_received;
+extern volatile bool     audio_streaming;
+
+#endif

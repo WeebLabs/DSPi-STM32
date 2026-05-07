@@ -22,6 +22,7 @@
 
 #include "main.h"
 #include "tusb.h"
+#include "usb_audio.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -55,14 +56,15 @@ int main(void) {
     USB_App_Init();   /* tud_init(0) — TinyUSB device stack */
 
     printf("\r\n");
-    printf("=== DSPi STM32H723 — M2 USB vendor echo ===\r\n");
+    printf("=== DSPi STM32H723 — M3 UAC1 OUT silence consumer ===\r\n");
     printf("  SYSCLK    = %lu Hz\r\n", (unsigned long)HAL_RCC_GetSysClockFreq());
     printf("  HCLK      = %lu Hz\r\n", (unsigned long)HAL_RCC_GetHCLKFreq());
     printf("  PCLK1     = %lu Hz\r\n", (unsigned long)HAL_RCC_GetPCLK1Freq());
     printf("  PCLK2     = %lu Hz\r\n", (unsigned long)HAL_RCC_GetPCLK2Freq());
     printf("  HSE       = %lu Hz (board crystal)\r\n", (unsigned long)HSE_VALUE);
-    printf("  USB FS    = PLL3Q -> 48 MHz (vendor echo, VID 0xCAFE PID 0x4001)\r\n");
-    printf("  Heartbeat LED on PE3 (1 Hz, on-board BLUE_LED, active LOW)\r\n");
+    printf("  USB FS    = PLL3Q -> 48 MHz (UAC1 device, VID 0xCAFE PID 0x4002)\r\n");
+    printf("  Audio     = 48 kHz / 16-bit / stereo, ISO OUT 0x01, FB IN 0x82\r\n");
+    printf("  Heartbeat LED on PE3 (1 Hz idle / 4 Hz mounted / 10 Hz lost)\r\n");
 
     /* Main loop runs the USB task continuously and toggles the heartbeat
      * about once per second based on a millisecond counter rather than a
@@ -89,10 +91,13 @@ int main(void) {
             last_blink_ms = now;
             HAL_GPIO_TogglePin(HEARTBEAT_LED_PORT, HEARTBEAT_LED_PIN);
             if ((tick & 0x07) == 0) {
-                printf("tick %lu  uptime=%lu ms  usb=%s\r\n",
+                printf("tick %lu  uptime=%lu ms  usb=%s  audio=%s pkts=%lu bytes=%lu\r\n",
                        (unsigned long)tick,
                        (unsigned long)now,
-                       mounted ? "mounted" : (was_ever_mounted ? "lost" : "idle"));
+                       mounted ? "mounted" : (was_ever_mounted ? "lost" : "idle"),
+                       audio_streaming ? "streaming" : "idle",
+                       (unsigned long)audio_packets_received,
+                       (unsigned long)audio_bytes_received);
             }
             tick++;
         }

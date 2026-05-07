@@ -91,32 +91,10 @@ void USB_Task(void) {
     tud_task();
 }
 
-/* ----------------------------------------------------------------------
- * Vendor class callbacks — echo bytes back as soon as they arrive.
- * tud_vendor_rx_cb fires whenever a packet lands on VENDOR_EP_OUT.
- * -------------------------------------------------------------------- */
-void tud_vendor_rx_cb(uint8_t itf, uint8_t const *buffer, uint16_t bufsize) {
-    (void)itf;
-    (void)buffer;
-
-    /* Move data from the RX FIFO straight into the TX FIFO. Using the
-     * read-and-discard helper avoids a second copy when we just want to
-     * mirror it back. */
-    uint8_t buf[CFG_TUD_VENDOR_EPSIZE];
-    uint32_t n;
-    while ((n = tud_vendor_n_available(itf)) > 0) {
-        if (n > sizeof(buf)) n = sizeof(buf);
-        n = tud_vendor_n_read(itf, buf, n);
-        tud_vendor_n_write(itf, buf, n);
-    }
-    tud_vendor_n_write_flush(itf);
-
-    (void)bufsize;
-}
-
-/* Optional: track host-side connect / disconnect via the heartbeat-like
- * state on UART. Not required for enumeration but useful for diagnostics. */
-void tud_mount_cb(void)   { /* nothing — could blink LED faster, etc. */ }
-void tud_umount_cb(void)  { }
+/* M3 USB callbacks — minimal. Class-specific work lives in usb_audio.c.
+ * These are the device-state bookkeeping hooks TinyUSB exposes to apps
+ * regardless of which class drivers are loaded. */
+void tud_mount_cb(void)   { /* host issued SetConfiguration */ }
+void tud_umount_cb(void)  { /* host disconnected or reset */ }
 void tud_suspend_cb(bool remote_wakeup_en) { (void)remote_wakeup_en; }
 void tud_resume_cb(void)  { }

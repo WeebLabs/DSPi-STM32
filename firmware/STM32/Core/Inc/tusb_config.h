@@ -37,25 +37,19 @@ extern "C" {
  * the standard for any non-trivial control transfer). */
 #define CFG_TUD_ENDPOINT0_SIZE      64
 
-/* Class enables — vendor only for M2.  Audio + bulk-notify EP arrive in
- * later milestones via usbd_app_driver_get_cb().  Keeping the slate
- * empty here matches the RP project's current convention. */
+/* M3: all built-in class drivers off. UAC1 lands via the custom class
+ * driver registered in usb_audio.c through usbd_app_driver_get_cb().
+ * Same convention the existing RP DSPi build uses. */
 #define CFG_TUD_AUDIO               0
 #define CFG_TUD_CDC                 0
 #define CFG_TUD_MSC                 0
 #define CFG_TUD_HID                 0
 #define CFG_TUD_MIDI                0
-#define CFG_TUD_VENDOR              1
+#define CFG_TUD_VENDOR              0
 #define CFG_TUD_DFU_RUNTIME         0
 #define CFG_TUD_ECM_RNDIS           0
 #define CFG_TUD_NCM                 0
 #define CFG_TUD_BTH                 0
-
-/* Vendor class FIFOs — one direction at a time, 256 B each is plenty for
- * an echo loop and leaves a wide margin in the dwc2 4 KB FIFO budget. */
-#define CFG_TUD_VENDOR_RX_BUFSIZE   256
-#define CFG_TUD_VENDOR_TX_BUFSIZE   256
-#define CFG_TUD_VENDOR_EPSIZE       64
 
 /* Memory placement / alignment.  TinyUSB on H7 dwc2 reads/writes the FIFO
  * via the AHB; descriptor and packet buffers can sit in regular SRAM and

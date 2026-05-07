@@ -37,14 +37,14 @@ add_executable(${EXE}
     Core/Src/syscalls.c
     Core/Src/usb_descriptors.c
     Core/Src/usb_glue.c
+    Core/Src/usb_audio.c
     # TinyUSB sources — kept as an explicit list so the milestone scope is
-    # obvious and we add new class drivers (audio, vendor-bulk-IN-notify,
-    # etc.) only when their milestone arrives.
+    # obvious. M3: device stack + dwc2 only — no built-in class drivers
+    # (UAC1 is registered through usbd_app_driver_get_cb() in usb_audio.c).
     ${TINYUSB_DIR}/src/tusb.c
     ${TINYUSB_DIR}/src/common/tusb_fifo.c
     ${TINYUSB_DIR}/src/device/usbd.c
     ${TINYUSB_DIR}/src/device/usbd_control.c
-    ${TINYUSB_DIR}/src/class/vendor/vendor_device.c
     ${TINYUSB_DIR}/src/portable/synopsys/dwc2/dcd_dwc2.c
     ${TINYUSB_DIR}/src/portable/synopsys/dwc2/dwc2_common.c
 )
