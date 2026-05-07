@@ -13,6 +13,8 @@ _deps
 firmware/build/*
 firmware/build-rp2350/*
 firmware/build-rp2040/*
+firmware/build-stm32h723/*
+build-stm32h723/
 firmware/build_release/*
 firmware/eclipse_build/*
 /pico-sdk
@@ -31,3 +33,4 @@ __pycache__/
 !Documentation/Roadmap.md
 !Documentation/Features/*.md
 !Documentation/Porting/*.md
+!firmware/STM32/README.md

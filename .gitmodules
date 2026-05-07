@@ -1,3 +1,9 @@
 [submodule "firmware/pico-sdk"]
 	path = firmware/pico-sdk
 	url = https://github.com/raspberrypi/pico-sdk.git
+[submodule "vendor/stm32-cmake"]
+	path = vendor/stm32-cmake
+	url = https://github.com/ObKo/stm32-cmake.git
+[submodule "vendor/STM32CubeH7"]
+	path = vendor/STM32CubeH7
+	url = https://github.com/STMicroelectronics/STM32CubeH7.git

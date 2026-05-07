@@ -603,22 +603,19 @@ The STM32H723 has 8 × 128 KB flash sectors (1 MB total, single bank). The exist
 
 **Flash sector erase kills the audio path.** On the RP2040, the DSPi already handles this by executing the flash code from RAM and muting audio for ~45 ms. On H7 the erase is ~18× longer (800 ms vs 45 ms).
 
-### Recommended redesign: external SPI Flash + LittleFS
+### Decision (2026-05-07): straight port to on-board W25Q64, no filesystem
 
-The WeAct board includes **8 MB SPI Flash** (W25Q64 or similar). Use this for the preset store:
+The WeAct board has an **8 MB W25Q64 SPI flash on SPI3** (PB3/PB4/PD7/PD6). Its erase granularity is **4 KB** — *identical* to the existing RP layout, so no redesign is needed. We do a 1:1 port:
 
-- SPI Flash erase granularity = 4 KB (matches the existing layout exactly)
-- 4 KB sector erase ≈ 50–100 ms (W25Q64 datasheet: typical 45 ms, max 400 ms)
-- 8 MB = room for 1000+ presets with the current 4 KB layout
-- LittleFS provides wear leveling, power-fail safety, and a simple `lfs_file_open/write/close` API
+- Keep the existing 12-sector × 4 KB preset layout (`PresetSlot`, `dir_cache`, `slot_buf`, `write_buf`).
+- Map the original "flash offset" addresses straight to W25Q64 byte offsets — same arithmetic, different physical store.
+- Replace the two pico-sdk call sites in `flash_storage.c` with a thin W25Q SPI driver: `w25q_sector_erase_4k(addr)` and `w25q_page_program(addr, buf, n)`. Page = 256 bytes (W25Q standard), sector = 4 KB (matches existing assumptions).
+- 4 KB sector erase ≈ 45–100 ms typical; same audio-mute window the RP build already implements via `preset_loading`. No timing redesign needed.
+- W25Q64 endurance = 100,000 erase cycles per sector. With 10 user-writable preset slots and a typical user save rate, this lasts decades. No wear leveling needed.
 
-LittleFS port for STM32 with W25Q: [github.com/stm32world/STM32_W25Qxx_LittleFS](https://stm32world.com/wiki/STM32_W25Qxx_LittleFS). For the initial port, you can even use a simpler flat layout without LittleFS if the preset count stays at 10—the endurance of a W25Q sector (100,000 cycles) is adequate.
+**No LittleFS, no internal-flash workaround, no on-board OSPI flash usage.** The OSPI flash pins are reclaimed for SAI2 (Section 0.4). The internal STM32 flash holds only firmware code — preset data lives entirely on external SPI flash.
 
-**If external flash is unavailable or undesirable:** use internal flash with a pack-and-relocate strategy. Pack all 10 preset slots plus the directory into one 128 KB flash sector. On save: read the whole sector to SRAM, modify in SRAM, erase the sector (mute audio for 800 ms), write back. The audio mute is handled with a `preset_loading` flag identical to the existing mechanism but with a much longer hold (800 ms → 1 second mute is audible and unacceptable for live use, but acceptable for a one-time save triggered by user action).
-
-**Recommendation: use external SPI flash.** Internal flash reserve 1 sector for factory defaults / UUID / calibration data (bootloader-written). Preset data moves to external flash via LittleFS.
-
-The `flash_storage.c` portability surface is clean: it uses `flash_range_erase()` and `flash_range_program()` from pico-sdk. Replace these two call sites with the W25Q HAL/LL SPI driver equivalents. The directory cache, slot buffer, and all preset parse/serialize logic is platform-agnostic.
+The `flash_storage.c` portability surface is clean: it uses `flash_range_erase()` and `flash_range_program()` from pico-sdk. Those two call sites get a W25Q-driven HAL/LL SPI replacement. The directory cache, slot buffer, version-migration code, and all preset parse/serialize logic is platform-agnostic and ports unchanged.
 
 ---
 
