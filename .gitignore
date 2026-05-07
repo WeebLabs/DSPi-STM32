@@ -34,3 +34,4 @@ __pycache__/
 !Documentation/Features/*.md
 !Documentation/Porting/*.md
 !firmware/STM32/README.md
+!firmware/STM32/scripts/*.sh

@@ -9,10 +9,14 @@
  * Clock plan (see Documentation/Porting/STM32H723_first_steps.md §0.5):
  *   HSE       = 25.000 MHz (WeAct V1.2 X1, confirmed)
  *   PLL1      = 25/2 × 44 → P=550 MHz → SYSCLK = 550 MHz
- *   PLL2_P   ≈ 49.15223 MHz (DIVM2=5, DIVN2=19, FRACN=5414, DIVP2=2)
- *               +4.7 ppm vs target 49.152 MHz — fine for 24-bit audio.
- *               PLL2 is configured here so M1 (scope on MCO) can verify it
- *               immediately.
+ *   PLL2_P   ≈ 49.151978 MHz (DIVM2=5, DIVN2=98, FRACN=2490, DIVP2=10)
+ *               −0.45 ppm vs target 49.152 MHz — inaudible.
+ *               VCO = 5 × (98 + 2490/8192) = 491.520 MHz (WIDE range OK).
+ *               An earlier draft used DIVN=19/FRACN=5414/DIVP=2; the math
+ *               worked but VCO landed at 98 MHz, below the 150 MHz minimum
+ *               of even the medium VCO range — PeriphCLKConfig returned
+ *               HAL_ERROR and we silently spun in Error_Handler. Lesson:
+ *               always check the VCO range, not just the output frequency.
  *   HSI48+CRS reserved for M2 (USB FS).
  */
 
@@ -35,8 +39,14 @@ int __io_putchar(int ch) {
 
 int main(void) {
     HAL_Init();
-    SystemClock_Config();
+
+    /* Initialise the heartbeat LED *before* the clock tree so any fault in
+     * SystemClock_Config() can manifest as a recognisably fast Error_Handler
+     * stutter rather than a silent dead pin. GPIO clock-enable works fine on
+     * the boot-default HSI 64 MHz path. */
     Heartbeat_LED_Init();
+
+    SystemClock_Config();
     Log_USART_Init();
     MCO_Init_PLL2P();
 
@@ -107,14 +117,14 @@ static void SystemClock_Config(void) {
 
     /* PLL2 — audio kernel clock 49.15223 MHz (FRACN). Section 0.5. */
     periph.PeriphClockSelection = RCC_PERIPHCLK_USART1;
-    periph.PLL2.PLL2M = 5;       /* 25/5 = 5 MHz */
-    periph.PLL2.PLL2N = 19;
-    periph.PLL2.PLL2P = 2;       /* VCO/2 → P */
+    periph.PLL2.PLL2M = 5;        /* 25/5 = 5 MHz VCO input */
+    periph.PLL2.PLL2N = 98;
+    periph.PLL2.PLL2P = 10;       /* VCO 491.52 MHz / 10 → 49.15198 MHz */
     periph.PLL2.PLL2Q = 2;
     periph.PLL2.PLL2R = 2;
-    periph.PLL2.PLL2RGE = RCC_PLL2VCIRANGE_2;   /* 4–8 MHz */
-    periph.PLL2.PLL2VCOSEL = RCC_PLL2VCOMEDIUM; /* medium 150–420 MHz */
-    periph.PLL2.PLL2FRACN  = 5414;              /* +0.66089 of N → ~98.30445 MHz VCO */
+    periph.PLL2.PLL2RGE    = RCC_PLL2VCIRANGE_2;   /* 4–8 MHz: 5 MHz fits */
+    periph.PLL2.PLL2VCOSEL = RCC_PLL2VCOWIDE;      /* wide 192–836 MHz */
+    periph.PLL2.PLL2FRACN  = 2490;                 /* −0.45 ppm vs 49.152 MHz */
     periph.Usart16ClockSelection = RCC_USART16CLKSOURCE_D2PCLK2;
     if (HAL_RCCEx_PeriphCLKConfig(&periph) != HAL_OK) Error_Handler();
 }
@@ -184,9 +194,13 @@ static void Log_USART_Init(void) {
 
 void Error_Handler(void) {
     __disable_irq();
-    while (1) {
-        /* Fast LED stutter so a hung board is visually obvious. */
+    /* Distinct ~10 Hz strobe — clearly faster than the 1 Hz heartbeat so a
+     * hung board is unambiguous. The inner-loop count is sized assuming
+     * HSI@64 MHz (the speed we run at if SystemClock_Config faulted before
+     * switching to PLL); at 550 MHz it'll appear ~9× faster, which is fine
+     * — it's still recognisably "fault" not "running." */
+    for (;;) {
         HAL_GPIO_TogglePin(HEARTBEAT_LED_PORT, HEARTBEAT_LED_PIN);
-        for (volatile int i = 0; i < 1000000; ++i) { __NOP(); }
+        for (volatile int i = 0; i < 320000; ++i) { __NOP(); }
     }
 }

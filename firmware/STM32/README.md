@@ -43,12 +43,20 @@ Outputs land in `build-stm32h723/`:
 
 1. Hold **BOOT0**, tap **NRST**, release **BOOT0** ~0.5 s later. The board
    re-enumerates as `STMicroelectronics STM Device in DFU Mode`.
-2. Flash:
+2. Use the helper script (it waits for DFU enumeration, flashes, and
+   issues a USB reset to land cleanly in user firmware):
    ```
-   dfu-util -a 0 -s 0x08000000:leave -D build-stm32h723/DSPi_stm32h723.bin
+   firmware/STM32/scripts/flash.sh
    ```
-   The `:leave` suffix tells the bootloader to jump to the user firmware on
-   completion, so you don't need to tap NRST a second time.
+   Equivalent raw `dfu-util` invocation:
+   ```
+   dfu-util -a 0 -s 0x08000000:leave -R -D build-stm32h723/DSPi_stm32h723.bin
+   ```
+   The H7's DFU bootloader (v0x011a) leaves enough USB peripheral state
+   behind that `:leave` alone often wedges user firmware until a manual
+   NRST press; the `-R` flag adds a USB-level reset that clears that
+   residue. If the LED still doesn't come up after the script reports
+   complete, tap **NRST** once.
 3. Watch USART1 (PA9 TX, PA10 RX) at 115200 8N1 for the heartbeat.
    The on-board `MCO1` pin (PA8) outputs the HSE crystal at 25 MHz — scope
    it to confirm the clock tree is alive.
