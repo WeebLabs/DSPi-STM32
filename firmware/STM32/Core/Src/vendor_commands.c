@@ -49,6 +49,7 @@ extern volatile float channel_gain_linear[3];
 extern volatile int32_t channel_gain_mul [3];
 extern volatile bool  channel_mute       [3];
 extern float channel_delays_ms[NUM_CHANNELS];
+extern uint8_t output_types[NUM_SPDIF_INSTANCES];
 
 static inline float db_to_linear(float db) {
     return powf(10.0f, db * 0.05f);
@@ -320,6 +321,22 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     v = matrix_mixer.outputs[out].delay_ms;
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 4);
+                }
+
+                case REQ_GET_CHANNEL_NAME: {
+                    uint8_t ch = req->wValue & 0xFF;
+                    if (ch >= NUM_CHANNELS) return false;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            channel_names[ch], PRESET_NAME_LEN);
+                }
+                case REQ_GET_OUTPUT_TYPE: {
+                    uint8_t slot = (uint8_t)req->wValue;
+                    if (slot >= NUM_SPDIF_INSTANCES) return false;
+                    static uint8_t v;
+                    v = output_types[slot];
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
                 }
                 case REQ_GET_EQ_PARAM: {
                     /* wValue encodes (channel<<8) | (band<<4) | param.
@@ -613,6 +630,31 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     leveller_reset_pending  = true;
                 }
                 break;
+
+            case REQ_SET_CHANNEL_NAME: {
+                uint8_t ch = vendor_last_wValue & 0xFF;
+                if (ch < NUM_CHANNELS && vendor_last_wLength > 0) {
+                    memset(channel_names[ch], 0, PRESET_NAME_LEN);
+                    size_t copy_len = vendor_last_wLength < (PRESET_NAME_LEN - 1)
+                                    ? vendor_last_wLength : (PRESET_NAME_LEN - 1);
+                    memcpy(channel_names[ch], vendor_rx_buf, copy_len);
+                }
+                break;
+            }
+            case REQ_SET_OUTPUT_TYPE: {
+                /* M7d simple version: just store the new type. The RP build
+                 * defers the actual SPDIF↔I2S DMA reconfigure to the main
+                 * loop because heap calls aren't ISR-safe — that complexity
+                 * arrives in M8 along with multi-instance SPDIF. For STM32
+                 * the SAI is fixed I2S, so this just keeps Console's UI
+                 * happy. */
+                uint8_t slot     =  vendor_last_wValue       & 0xFF;
+                uint8_t new_type = (vendor_last_wValue >> 8) & 0xFF;
+                if (slot < NUM_SPDIF_INSTANCES && new_type <= 1) {
+                    output_types[slot] = new_type;
+                }
+                break;
+            }
 
             default:
                 /* Other SETs land here once their handlers arrive. */
