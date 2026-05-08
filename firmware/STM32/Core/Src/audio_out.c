@@ -33,6 +33,7 @@
 #include "usb_audio.h"
 #include "dsp_pipeline.h"  /* M7c: per-channel biquad EQ */
 #include "crossfeed.h"     /* M7d: BS2B crossfeed */
+#include "leveller.h"      /* M7d: volume leveller */
 
 /* ---- Single shared DMA ring in AXI SRAM (DMA1 cannot reach DTCM) ---- */
 #define AUDIO_BUFFER_BASE  0x24000000UL
@@ -90,9 +91,23 @@ extern volatile float master_volume_linear;
 extern volatile bool  bypass_master_eq;
 extern volatile CrossfeedConfig crossfeed_config;
 extern volatile bool            crossfeed_update_pending;
+extern volatile LevellerConfig  leveller_config;
+extern volatile bool            leveller_update_pending;
+extern volatile bool            leveller_reset_pending;
 
-/* Local crossfeed state (zeroed on init by Audio_Init). */
+/* Local DSP state (zeroed on init by Audio_Init). */
 static CrossfeedState crossfeed_state;
+static LevellerState  leveller_state;
+static LevellerCoeffs leveller_coeffs;
+
+/* Block-based per-stage scratch buffers — one half-buffer's worth.
+ * Each stage operates on the full block in-place. AXI SRAM-resident
+ * via the shared audio_buf placement isn't required here (these are
+ * CPU-only) so they live as plain BSS in DTCM (faster, no DMA). */
+static float buf_l[AUDIO_FRAMES_HALF];
+static float buf_r[AUDIO_FRAMES_HALF];
+static float buf_o0[AUDIO_FRAMES_HALF];
+static float buf_o1[AUDIO_FRAMES_HALF];
 
 /* Per-output EQ channel index: Out0 → channel 2, Out1 → channel 3. */
 #define EQ_CH_OUT0    2
@@ -125,62 +140,90 @@ static void fill_half(int32_t *dst) {
     float out1_post_gain = (out1->enabled && !out1->mute) ? out1->gain_linear : 0.0f;
 
     /* M7d: per-input preamp + master volume + bypass snapshots —
-     * once per buffer-half so the inner sample loop stays branch-light. */
+     * once per buffer-half so the per-sample loops stay branch-light. */
     float preamp_l = global_preamp_linear[0];
     float preamp_r = global_preamp_linear[1];
     float master   = master_volume_linear;
     bool  eq_bypass = bypass_master_eq;
     bool  cf_active = crossfeed_config.enabled;
+    bool  lv_active = leveller_config.enabled;
 
-    /* Apply pending crossfeed coefficient recompute (set when Console
-     * changes any crossfeed param). Cheap: a few floats; runs once
-     * per buffer-half not per sample. */
+    /* Apply pending crossfeed / leveller coefficient recomputes (set
+     * when Console changes any param). Cheap and once per buffer-half. */
     if (crossfeed_update_pending) {
         crossfeed_update_pending = false;
         crossfeed_compute_coefficients(&crossfeed_state,
                                         (CrossfeedConfig *)&crossfeed_config,
                                         48000.0f);
     }
+    if (leveller_update_pending) {
+        leveller_update_pending = false;
+        leveller_compute_coefficients(&leveller_coeffs,
+                                       (LevellerConfig *)&leveller_config,
+                                       48000.0f);
+    }
+    if (leveller_reset_pending) {
+        leveller_reset_pending = false;
+        leveller_reset_state(&leveller_state);
+    }
 
+    /* === Stage 1: depacketize USB int16 stereo → buf_l / buf_r float
+     *               with per-input preamp folded in. Pad shortfall
+     *               with silence. */
     uint32_t i;
     for (i = 0; i < got; ++i) {
-        float L = (float)pop_scratch[2*i + 0] * INT16_RECIP * preamp_l;
-        float R = (float)pop_scratch[2*i + 1] * INT16_RECIP * preamp_r;
-
-        /* Per-input EQ — skipped when master bypass is on. */
-        if (!eq_bypass) {
-            L = dsp_process_channel(filters[0], L, 0);
-            R = dsp_process_channel(filters[1], R, 1);
-        }
-
-        /* Crossfeed (BS2B) on the post-EQ stereo bus. */
-        if (cf_active) {
-            crossfeed_process_stereo(&crossfeed_state, &L, &R);
-        }
-
-        /* Matrix mix → per-output samples */
-        float o0 = L * g_l_to_o0 + R * g_r_to_o0;
-        float o1 = L * g_l_to_o1 + R * g_r_to_o1;
-
-        /* Per-output EQ — also skipped on master bypass. */
-        if (!eq_bypass) {
-            o0 = dsp_process_channel(filters[EQ_CH_OUT0], o0, EQ_CH_OUT0);
-            o1 = dsp_process_channel(filters[EQ_CH_OUT1], o1, EQ_CH_OUT1);
-        }
-
-        /* Per-output gain + mute, then master volume ceiling. */
-        o0 *= out0_post_gain * master;
-        o1 *= out1_post_gain * master;
-
-        /* Soft-clamp at ±1.0 before quantising to 24-bit. */
-        if (o0 >  1.0f) o0 =  1.0f; else if (o0 < -1.0f) o0 = -1.0f;
-        if (o1 >  1.0f) o1 =  1.0f; else if (o1 < -1.0f) o1 = -1.0f;
-        dst[2*i + 0] = (int32_t)(o0 * FLOAT_TO_24);
-        dst[2*i + 1] = (int32_t)(o1 * FLOAT_TO_24);
+        buf_l[i] = (float)pop_scratch[2*i + 0] * INT16_RECIP * preamp_l;
+        buf_r[i] = (float)pop_scratch[2*i + 1] * INT16_RECIP * preamp_r;
     }
     for (; i < AUDIO_FRAMES_HALF; ++i) {
-        dst[2*i + 0] = 0;
-        dst[2*i + 1] = 0;
+        buf_l[i] = 0.0f;
+        buf_r[i] = 0.0f;
+    }
+
+    /* === Stage 2: per-input EQ (block-based — uses dsp_process_channel
+     *               -block which is faster than per-sample dispatch). */
+    if (!eq_bypass) {
+        dsp_process_channel_block(filters[0], buf_l, AUDIO_FRAMES_HALF, 0);
+        dsp_process_channel_block(filters[1], buf_r, AUDIO_FRAMES_HALF, 1);
+    }
+
+    /* === Stage 3: crossfeed (per-sample API — fold into a tight loop). */
+    if (cf_active) {
+        for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
+            crossfeed_process_stereo(&crossfeed_state, &buf_l[k], &buf_r[k]);
+        }
+    }
+
+    /* === Stage 4: volume leveller (block-based, stereo-linked AGC). */
+    if (lv_active) {
+        leveller_process_block(&leveller_state, &leveller_coeffs,
+                               (LevellerConfig *)&leveller_config,
+                               buf_l, buf_r, AUDIO_FRAMES_HALF);
+    }
+
+    /* === Stage 5: matrix mixer → per-output buffers. */
+    for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
+        buf_o0[k] = buf_l[k] * g_l_to_o0 + buf_r[k] * g_r_to_o0;
+        buf_o1[k] = buf_l[k] * g_l_to_o1 + buf_r[k] * g_r_to_o1;
+    }
+
+    /* === Stage 6: per-output EQ (block-based, channels 2/3). */
+    if (!eq_bypass) {
+        dsp_process_channel_block(filters[EQ_CH_OUT0], buf_o0,
+                                  AUDIO_FRAMES_HALF, EQ_CH_OUT0);
+        dsp_process_channel_block(filters[EQ_CH_OUT1], buf_o1,
+                                  AUDIO_FRAMES_HALF, EQ_CH_OUT1);
+    }
+
+    /* === Stage 7: per-output gain + master volume + clamp + 24-bit
+     *               quantisation into the SAI ping-pong slot. */
+    for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
+        float o0 = buf_o0[k] * out0_post_gain * master;
+        float o1 = buf_o1[k] * out1_post_gain * master;
+        if (o0 >  1.0f) o0 =  1.0f; else if (o0 < -1.0f) o0 = -1.0f;
+        if (o1 >  1.0f) o1 =  1.0f; else if (o1 < -1.0f) o1 = -1.0f;
+        dst[2*k + 0] = (int32_t)(o0 * FLOAT_TO_24);
+        dst[2*k + 1] = (int32_t)(o1 * FLOAT_TO_24);
     }
 }
 
@@ -336,13 +379,17 @@ void Audio_Init(void) {
         audio_buf[i] = 0;
     }
 
-    /* M7d: init crossfeed state + initial coefficients. Default config
-     * is disabled, so the coefficients only take effect once the user
-     * enables crossfeed in Console. */
+    /* M7d: init crossfeed + leveller state + initial coefficients.
+     * Default configs are disabled, so the coefficients only take
+     * effect once the user enables them in Console. */
     crossfeed_init(&crossfeed_state);
     crossfeed_compute_coefficients(&crossfeed_state,
                                     (CrossfeedConfig *)&crossfeed_config,
                                     48000.0f);
+    leveller_reset_state(&leveller_state);
+    leveller_compute_coefficients(&leveller_coeffs,
+                                  (LevellerConfig *)&leveller_config,
+                                  48000.0f);
 }
 
 void Audio_Start(void) {
