@@ -41,6 +41,16 @@ int __io_putchar(int ch) {
 }
 
 int main(void) {
+    /* M7d: enable Cortex-M7 instruction cache. Without this every
+     * instruction fetch from flash hits the 4-wait-state interface and
+     * the per-sample DSP path can't keep up at 48 kHz once more than a
+     * handful of biquads are active (audio garbles). I-cache is safe
+     * to enable unconditionally on H7 — it's invisible to DMA and
+     * doesn't need MPU configuration (unlike D-cache, which arrives in
+     * M6c with a proper non-cacheable region for the SAI ping-pong
+     * buffer). */
+    SCB_EnableICache();
+
     HAL_Init();
 
     /* Initialise the heartbeat LED *before* the clock tree so any fault in

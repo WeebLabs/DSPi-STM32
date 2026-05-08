@@ -7,7 +7,7 @@
 #define LOUDNESS_VOL_STEPS    61
 
 // Coefficients-only struct (state lives separately per channel)
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
 typedef struct {
     float sva1, sva2, sva3;    // SVF integrator coefficients
     float svm0, svm1, svm2;    // SVF output mix coefficients (shelf: general formula)

@@ -32,6 +32,7 @@
 #include "main.h"
 #include "usb_audio.h"
 #include "dsp_pipeline.h"  /* M7c: per-channel biquad EQ */
+#include "crossfeed.h"     /* M7d: BS2B crossfeed */
 
 /* ---- Single shared DMA ring in AXI SRAM (DMA1 cannot reach DTCM) ---- */
 #define AUDIO_BUFFER_BASE  0x24000000UL
@@ -87,6 +88,11 @@ extern MatrixMixer matrix_mixer;
 extern volatile float global_preamp_linear[NUM_INPUT_CHANNELS];
 extern volatile float master_volume_linear;
 extern volatile bool  bypass_master_eq;
+extern volatile CrossfeedConfig crossfeed_config;
+extern volatile bool            crossfeed_update_pending;
+
+/* Local crossfeed state (zeroed on init by Audio_Init). */
+static CrossfeedState crossfeed_state;
 
 /* Per-output EQ channel index: Out0 → channel 2, Out1 → channel 3. */
 #define EQ_CH_OUT0    2
@@ -124,6 +130,17 @@ static void fill_half(int32_t *dst) {
     float preamp_r = global_preamp_linear[1];
     float master   = master_volume_linear;
     bool  eq_bypass = bypass_master_eq;
+    bool  cf_active = crossfeed_config.enabled;
+
+    /* Apply pending crossfeed coefficient recompute (set when Console
+     * changes any crossfeed param). Cheap: a few floats; runs once
+     * per buffer-half not per sample. */
+    if (crossfeed_update_pending) {
+        crossfeed_update_pending = false;
+        crossfeed_compute_coefficients(&crossfeed_state,
+                                        (CrossfeedConfig *)&crossfeed_config,
+                                        48000.0f);
+    }
 
     uint32_t i;
     for (i = 0; i < got; ++i) {
@@ -134,6 +151,11 @@ static void fill_half(int32_t *dst) {
         if (!eq_bypass) {
             L = dsp_process_channel(filters[0], L, 0);
             R = dsp_process_channel(filters[1], R, 1);
+        }
+
+        /* Crossfeed (BS2B) on the post-EQ stereo bus. */
+        if (cf_active) {
+            crossfeed_process_stereo(&crossfeed_state, &L, &R);
         }
 
         /* Matrix mix → per-output samples */
@@ -313,6 +335,14 @@ void Audio_Init(void) {
     for (uint32_t i = 0; i < AUDIO_WORDS_TOTAL; ++i) {
         audio_buf[i] = 0;
     }
+
+    /* M7d: init crossfeed state + initial coefficients. Default config
+     * is disabled, so the coefficients only take effect once the user
+     * enables crossfeed in Console. */
+    crossfeed_init(&crossfeed_state);
+    crossfeed_compute_coefficients(&crossfeed_state,
+                                    (CrossfeedConfig *)&crossfeed_config,
+                                    48000.0f);
 }
 
 void Audio_Start(void) {

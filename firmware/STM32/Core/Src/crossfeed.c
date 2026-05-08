@@ -108,7 +108,7 @@ void crossfeed_compute_coefficients(CrossfeedState *state, const CrossfeedConfig
         ap_a_f = 1.0f;  // ITD disabled: all-pass is passthrough
     }
 
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
     state->lp_a0 = lp_a0_f;
     state->lp_b1 = lp_b1_f;
     state->ap_a = ap_a_f;
@@ -126,7 +126,7 @@ void crossfeed_compute_coefficients(CrossfeedState *state, const CrossfeedConfig
     state->ap_state_R = 0;
 }
 
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
 // RP2350 Float processing
 DSP_TIME_CRITICAL
 void crossfeed_process_stereo(CrossfeedState *state, float *left, float *right) {

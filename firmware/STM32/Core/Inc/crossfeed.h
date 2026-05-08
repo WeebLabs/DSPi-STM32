@@ -42,7 +42,7 @@ typedef struct {
 // The complementary subtraction guarantees mono unity at DC.
 // The all-pass on the crossfeed path adds interaural time delay (~220us)
 // to simulate sound traveling around the head.
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
 typedef struct {
     float lp_a0, lp_b1;                // Lowpass coefficients
     float lp_state_L, lp_state_R;      // Lowpass filter state
@@ -63,7 +63,7 @@ void crossfeed_init(CrossfeedState *state);
 void crossfeed_compute_coefficients(CrossfeedState *state, const CrossfeedConfig *config, float sample_rate);
 
 // Time-critical stereo processing - modifies left/right in place
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
 void crossfeed_process_stereo(CrossfeedState *state, float *left, float *right);
 #else
 void crossfeed_process_stereo(CrossfeedState *state, int32_t *left, int32_t *right);

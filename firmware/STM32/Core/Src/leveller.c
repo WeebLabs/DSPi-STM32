@@ -94,7 +94,7 @@ void leveller_compute_coefficients(LevellerCoeffs *out,
 
 void leveller_reset_state(LevellerState *state) {
     memset(state, 0, sizeof(LevellerState));
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
     state->gain_linear = 1.0f;
     state->gain_prev_linear = 1.0f;
 #else
@@ -142,8 +142,7 @@ static inline float gain_computer(float x_db, float threshold, float ratio,
 // RP2350 Float Block Processing
 // ---------------------------------------------------------------------------
 
-#if PICO_RP2350
-
+#if PICO_RP2350 || defined(STM32H723xx)
 DSP_TIME_CRITICAL
 void leveller_process_block(LevellerState *state,
                             const LevellerCoeffs *coeffs,

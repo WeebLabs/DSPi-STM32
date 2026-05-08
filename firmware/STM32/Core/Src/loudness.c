@@ -89,7 +89,7 @@ static void compute_shelf_coeffs(float freq, float Q, float gain_db,
     // Identity if no gain
     if (fabsf(gain_db) < 0.01f) {
         out->bypass = true;
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
         out->sva1 = 0.0f; out->sva2 = 0.0f; out->sva3 = 0.0f;
         out->svm0 = 0.0f; out->svm1 = 0.0f; out->svm2 = 0.0f;
 #else
@@ -103,7 +103,7 @@ static void compute_shelf_coeffs(float freq, float Q, float gain_db,
 
     float A = powf(10.0f, gain_db / 40.0f);
 
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
     // SVF shelf coefficients (Simper, "SvfLinearTrapAllOutputs", Cytomic 2021)
     // k = 1/Q matches RBJ Audio-EQ-Cookbook shelf response exactly.
     float g = tanf(3.1415926535f * freq / sample_rate);

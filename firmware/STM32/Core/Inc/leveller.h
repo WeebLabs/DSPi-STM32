@@ -99,8 +99,7 @@ typedef struct {
 // Runtime State (not persisted)
 // ---------------------------------------------------------------------------
 
-#if PICO_RP2350
-
+#if PICO_RP2350 || defined(STM32H723xx)
 typedef struct {
     // Per-channel RMS squared envelopes
     float env_sq_l;
@@ -153,7 +152,7 @@ void leveller_reset_state(LevellerState *state);
 // Applies RMS envelope update, gain computation, lookahead delay (if enabled),
 // gain interpolation, and safety limiter.
 // Marked DSP_TIME_CRITICAL — runs in the audio callback.
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
 void leveller_process_block(LevellerState *state,
                             const LevellerCoeffs *coeffs,
                             const LevellerConfig *cfg,
