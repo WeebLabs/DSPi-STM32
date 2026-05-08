@@ -554,6 +554,18 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                             (tusb_control_request_t *)req,
                                             &resp, 4);
                 }
+                case REQ_GET_BAND_BYPASS: {
+                    /* wValue = (channel<<8) | band — payload 1 byte. */
+                    uint8_t ch   = (req->wValue >> 8) & 0xFF;
+                    uint8_t band =  req->wValue       & 0xFF;
+                    if (ch >= NUM_CHANNELS
+                        || band >= channel_band_counts[ch]) return false;
+                    static uint8_t v;
+                    v = (filter_recipes[ch][band].bypass == 1) ? 1 : 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &v, 1);
+                }
                 default:
                     return false;
             }
@@ -603,6 +615,26 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     dsp_compute_coefficients(&filter_recipes[pkt.channel][pkt.band],
                                              &filters[pkt.channel][pkt.band],
                                              48000.0f);
+                }
+                break;
+            }
+
+            case REQ_SET_BAND_BYPASS: {
+                /* Console toggles the per-band bypass via this dedicated
+                 * opcode (NOT REQ_SET_EQ_PARAM). wValue = (ch<<8)|band,
+                 * payload = 1 byte (1 = bypass, else active). Recompute
+                 * coefficients so dsp_pipeline picks up the new bypass
+                 * flag — without that the filters[][] entry's compiled
+                 * state still applies the old (un-bypassed) curve. */
+                if (vendor_last_wLength < 1) break;
+                uint8_t ch   = (vendor_last_wValue >> 8) & 0xFF;
+                uint8_t band =  vendor_last_wValue       & 0xFF;
+                if (ch < NUM_CHANNELS && band < channel_band_counts[ch]) {
+                    filter_recipes[ch][band].bypass =
+                        (vendor_rx_buf[0] == 1) ? 1 : 0;
+                    dsp_compute_coefficients(&filter_recipes[ch][band],
+                                             &filters[ch][band],
+                                             (float)audio_state.freq);
                 }
                 break;
             }
