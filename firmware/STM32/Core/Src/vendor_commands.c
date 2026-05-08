@@ -50,6 +50,11 @@ extern volatile int32_t channel_gain_mul [3];
 extern volatile bool  channel_mute       [3];
 extern float channel_delays_ms[NUM_CHANNELS];
 extern uint8_t output_types[NUM_SPDIF_INSTANCES];
+extern uint8_t output_pins[NUM_PIN_OUTPUTS];
+extern uint8_t  i2s_bck_pin;
+extern uint8_t  i2s_mck_pin;
+extern bool     i2s_mck_enabled;
+extern uint16_t i2s_mck_multiplier;
 
 static inline float db_to_linear(float db) {
     return powf(10.0f, db * 0.05f);
@@ -337,6 +342,122 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     v = output_types[slot];
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 1);
+                }
+
+                /* ---- I2S clock / pin config (Console probes these) ---- */
+                case REQ_GET_I2S_BCK_PIN: {
+                    static uint8_t v; v = i2s_bck_pin;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_MCK_ENABLE: {
+                    static uint8_t v; v = i2s_mck_enabled ? 1 : 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_MCK_PIN: {
+                    static uint8_t v; v = i2s_mck_pin;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_MCK_MULTIPLIER: {
+                    static uint16_t v; v = i2s_mck_multiplier;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 2);
+                }
+
+                /* ---- Per-output pin (SPDIF/PDM GPIO assignments) ---- */
+                case REQ_GET_OUTPUT_PIN: {
+                    uint8_t out = (uint8_t)req->wValue;
+                    if (out >= NUM_PIN_OUTPUTS) return false;
+                    static uint8_t v; v = output_pins[out];
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+
+                /* ---- Identification ---- */
+                case REQ_GET_SERIAL: {
+                    /* 16-byte ASCII serial. Use the same string Console
+                     * shows in System Info; padded with zeros. */
+                    static uint8_t serial[16] = "0001";
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            serial, sizeof(serial));
+                }
+
+                /* ---- Core 1 mode (no Core 1 on H723) ---- */
+                case REQ_GET_CORE1_MODE: {
+                    static uint8_t v = 0; /* CORE1_MODE_IDLE — no second core */
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_CORE1_CONFLICT: {
+                    /* No conflicts — single core handles everything. */
+                    static uint8_t v = 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+
+                /* ---- Master volume mode (independent / per-preset) ---- */
+                case REQ_GET_MASTER_VOLUME_MODE: {
+                    static uint8_t v = 0; /* MASTER_VOLUME_MODE_INDEPENDENT */
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+
+                /* ---- SPDIF RX pin (no SPDIF RX in M7d) ---- */
+                case REQ_GET_SPDIF_RX_PIN: {
+                    static uint8_t v = 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+
+                /* ---- Preset directory: empty (no preset storage in M7d) ----
+                 *
+                 *   [0-1] occupied bitmask u16 = 0  (no slots filled)
+                 *   [2]   startup_mode = 0         (no auto-load)
+                 *   [3]   default_slot = 0
+                 *   [4]   last_active = 0
+                 *   [5]   include_pins = 0
+                 *   [6]   master_volume_mode = 0
+                 */
+                case REQ_PRESET_GET_DIR: {
+                    static uint8_t dir[7] = { 0 };
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            dir, sizeof(dir));
+                }
+                case REQ_PRESET_GET_ACTIVE: {
+                    static uint8_t v = 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_PRESET_GET_STARTUP: {
+                    static uint8_t v[3] = { 0, 0, 0 };
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            v, sizeof(v));
+                }
+                case REQ_PRESET_GET_INCLUDE_PINS: {
+                    static uint8_t v = 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_PRESET_GET_NAME: {
+                    /* All slots empty — return zero-filled name. */
+                    static char nm[32] = { 0 };
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            nm, sizeof(nm));
+                }
+
+                /* ---- Clear clips ---- */
+                case REQ_CLEAR_CLIPS: {
+                    static uint16_t f;
+                    f = global_status.clip_flags;
+                    global_status.clip_flags = 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &f, 2);
                 }
                 case REQ_GET_EQ_PARAM: {
                     /* wValue encodes (channel<<8) | (band<<4) | param.
@@ -642,12 +763,6 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 break;
             }
             case REQ_SET_OUTPUT_TYPE: {
-                /* M7d simple version: just store the new type. The RP build
-                 * defers the actual SPDIF↔I2S DMA reconfigure to the main
-                 * loop because heap calls aren't ISR-safe — that complexity
-                 * arrives in M8 along with multi-instance SPDIF. For STM32
-                 * the SAI is fixed I2S, so this just keeps Console's UI
-                 * happy. */
                 uint8_t slot     =  vendor_last_wValue       & 0xFF;
                 uint8_t new_type = (vendor_last_wValue >> 8) & 0xFF;
                 if (slot < NUM_SPDIF_INSTANCES && new_type <= 1) {
@@ -655,6 +770,39 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 }
                 break;
             }
+
+            /* ---- I2S clock + pin config ---- */
+            case REQ_SET_I2S_BCK_PIN:
+                if (vendor_last_wLength >= 1) i2s_bck_pin = vendor_rx_buf[0];
+                break;
+            case REQ_SET_MCK_ENABLE:
+                if (vendor_last_wLength >= 1) i2s_mck_enabled = (vendor_rx_buf[0] != 0);
+                break;
+            case REQ_SET_MCK_PIN:
+                if (vendor_last_wLength >= 1) i2s_mck_pin = vendor_rx_buf[0];
+                break;
+            case REQ_SET_MCK_MULTIPLIER:
+                if (vendor_last_wLength >= 2)
+                    memcpy((void *)&i2s_mck_multiplier, vendor_rx_buf, 2);
+                break;
+
+            case REQ_SET_OUTPUT_PIN: {
+                uint8_t out = vendor_last_wValue & 0xFF;
+                if (out < NUM_PIN_OUTPUTS && vendor_last_wLength >= 1)
+                    output_pins[out] = vendor_rx_buf[0];
+                break;
+            }
+
+            /* ---- Preset SETs are silent no-ops in M7d (no flash storage)
+             * — Console UI will think the save succeeded but nothing
+             * persists. M11 wires real preset storage on the W25Q64. */
+            case REQ_PRESET_SAVE:
+            case REQ_PRESET_LOAD:
+            case REQ_PRESET_DELETE:
+            case REQ_PRESET_SET_NAME:
+            case REQ_PRESET_SET_STARTUP:
+            case REQ_PRESET_SET_INCLUDE_PINS:
+                break;
 
             default:
                 /* Other SETs land here once their handlers arrive. */
