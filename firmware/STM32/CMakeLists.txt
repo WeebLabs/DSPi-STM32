@@ -40,6 +40,14 @@ add_executable(${EXE}
     Core/Src/usb_audio.c
     Core/Src/vendor_commands.c
     Core/Src/audio_out.c
+    # M7b: DSP-pipeline state + portable DSP source files
+    Core/Src/audio_state.c
+    Core/Src/audio_input.c
+    Core/Src/bulk_params.c
+    Core/Src/notify.c
+    Core/Src/crossfeed.c
+    Core/Src/leveller.c
+    Core/Src/loudness.c
     # TinyUSB sources — kept as an explicit list so the milestone scope is
     # obvious. M3: device stack + dwc2 only — no built-in class drivers
     # (UAC1 is registered through usbd_app_driver_get_cb() in usb_audio.c).

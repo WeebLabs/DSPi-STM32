@@ -11,6 +11,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "config.h"     /* NUM_CHANNELS, PRESET_NAME_LEN, MatrixMixer, etc. */
 
 /* ---- Endpoint addresses ---- */
 #define AUDIO_OUT_ENDPOINT      0x01    /* ISO OUT, host -> device */
@@ -51,6 +52,30 @@
 extern volatile uint32_t audio_bytes_received;
 extern volatile uint32_t audio_packets_received;
 extern volatile bool     audio_streaming;
+
+/* AudioState — top-level UI mirror. Imported from
+ * firmware/DSPi/usb_audio.h so the bulk_params wire format matches.
+ * Fields are written by USB control requests (volume/mute) and the
+ * input source (sample rate) and read by the DSP/host. */
+typedef struct {
+    uint32_t freq;
+    int16_t  volume;
+    int16_t  vol_mul;
+    bool     mute;
+} AudioState;
+extern volatile AudioState audio_state;
+extern volatile bool       bypass_master_eq;
+
+/* DSP-pipeline globals — defined in audio_state.c. The bulk_params /
+ * notify / vendor command code expects these names verbatim from the RP
+ * project so wire-format compatibility holds. */
+extern char channel_names[NUM_CHANNELS][PRESET_NAME_LEN];
+
+/* Called when the host changes master volume through any path (UAC1
+ * volume control, vendor command, bulk param SET). Currently a stub
+ * (M7b) that just clamps and stores the value; M7c+ wires it to the
+ * SAI output gain stage. */
+void update_master_volume(float db);
 
 /* USB→SAI ring (M6a). The UAC1 ISO OUT EP writes 16-bit stereo PCM
  * frames here; audio_out.c reads them out into the SAI ping-pong
