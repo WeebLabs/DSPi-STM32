@@ -32,6 +32,24 @@ extern volatile int32_t  global_preamp_mul   [NUM_INPUT_CHANNELS];
 extern volatile float    master_volume_db;
 extern volatile SystemStatusPacket global_status;
 
+extern volatile bool   bypass_master_eq;
+extern volatile bool   loudness_enabled;
+extern volatile float  loudness_ref_spl;
+extern volatile float  loudness_intensity_pct;
+extern volatile bool   loudness_recompute_pending;
+#include "crossfeed.h"
+extern volatile CrossfeedConfig crossfeed_config;
+extern volatile bool            crossfeed_update_pending;
+#include "leveller.h"
+extern volatile LevellerConfig leveller_config;
+extern volatile bool           leveller_update_pending;
+extern volatile bool           leveller_reset_pending;
+extern volatile float channel_gain_db    [3];
+extern volatile float channel_gain_linear[3];
+extern volatile int32_t channel_gain_mul [3];
+extern volatile bool  channel_mute       [3];
+extern float channel_delays_ms[NUM_CHANNELS];
+
 static inline float db_to_linear(float db) {
     return powf(10.0f, db * 0.05f);
 }
@@ -155,6 +173,105 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     static uint8_t src = INPUT_SOURCE_USB;
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &src, 1);
+                }
+
+                case REQ_GET_BYPASS: {
+                    static uint8_t v;
+                    v = bypass_master_eq ? 1 : 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_DELAY: {
+                    uint8_t ch = req->wValue & 0xFF;
+                    if (ch >= NUM_CHANNELS) return false;
+                    static float v;
+                    v = channel_delays_ms[ch];
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
+                case REQ_GET_CHANNEL_GAIN: {
+                    uint8_t ch = req->wValue & 0xFF;
+                    if (ch >= 3) return false;
+                    static float v;
+                    v = channel_gain_db[ch];
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
+                case REQ_GET_CHANNEL_MUTE: {
+                    uint8_t ch = req->wValue & 0xFF;
+                    if (ch >= 3) return false;
+                    static uint8_t v;
+                    v = channel_mute[ch] ? 1 : 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+
+                case REQ_GET_LOUDNESS: {
+                    static uint8_t v; v = loudness_enabled ? 1 : 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_LOUDNESS_REF: {
+                    static float v; v = loudness_ref_spl;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
+                case REQ_GET_LOUDNESS_INTENSITY: {
+                    static float v; v = loudness_intensity_pct;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
+
+                case REQ_GET_CROSSFEED: {
+                    static uint8_t v; v = crossfeed_config.enabled ? 1 : 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_CROSSFEED_PRESET: {
+                    static uint8_t v; v = crossfeed_config.preset;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_CROSSFEED_FREQ: {
+                    static float v; v = crossfeed_config.custom_fc;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
+                case REQ_GET_CROSSFEED_FEED: {
+                    static float v; v = crossfeed_config.custom_feed_db;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
+                case REQ_GET_CROSSFEED_ITD: {
+                    static uint8_t v; v = crossfeed_config.itd_enabled ? 1 : 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+
+                case REQ_GET_LEVELLER_ENABLE: {
+                    static uint8_t v; v = leveller_config.enabled ? 1 : 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_LEVELLER_AMOUNT: {
+                    static float v; v = leveller_config.amount;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
+                case REQ_GET_LEVELLER_SPEED: {
+                    static uint8_t v; v = leveller_config.speed;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_LEVELLER_MAX_GAIN: {
+                    static float v; v = leveller_config.max_gain_db;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
+                case REQ_GET_LEVELLER_LOOKAHEAD: {
+                    static uint8_t v; v = leveller_config.lookahead ? 1 : 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
                 }
                 case REQ_GET_EQ_PARAM: {
                     /* wValue encodes (channel<<8) | (band<<4) | param.
@@ -306,6 +423,148 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 update_master_volume(db);
                 break;
             }
+
+            case REQ_SET_BYPASS:
+                if (vendor_last_wLength >= 1)
+                    bypass_master_eq = (vendor_rx_buf[0] != 0);
+                break;
+
+            case REQ_SET_DELAY: {
+                uint8_t ch = vendor_last_wValue & 0xFF;
+                if (ch < NUM_CHANNELS && vendor_last_wLength >= 4) {
+                    float ms; memcpy(&ms, vendor_rx_buf, 4);
+                    if (ms < 0) ms = 0;
+                    channel_delays_ms[ch] = ms;
+                    /* dsp_update_delay_samples deferred — delays don't apply
+                     * to audio yet (no delay-line stage in fill_half). */
+                }
+                break;
+            }
+
+            case REQ_SET_CHANNEL_GAIN: {
+                uint8_t ch = vendor_last_wValue & 0xFF;
+                if (ch < 3 && vendor_last_wLength >= 4) {
+                    float db; memcpy(&db, vendor_rx_buf, 4);
+                    float lin = db_to_linear(db);
+                    channel_gain_db    [ch] = db;
+                    channel_gain_linear[ch] = lin;
+                    channel_gain_mul   [ch] = (int32_t)(lin * 32768.0f);
+                }
+                break;
+            }
+            case REQ_SET_CHANNEL_MUTE: {
+                uint8_t ch = vendor_last_wValue & 0xFF;
+                if (ch < 3 && vendor_last_wLength >= 1)
+                    channel_mute[ch] = (vendor_rx_buf[0] != 0);
+                break;
+            }
+
+            case REQ_SET_LOUDNESS:
+                if (vendor_last_wLength >= 1)
+                    loudness_enabled = (vendor_rx_buf[0] != 0);
+                break;
+            case REQ_SET_LOUDNESS_REF:
+                if (vendor_last_wLength >= 4) {
+                    float v; memcpy(&v, vendor_rx_buf, 4);
+                    if (v <  40.0f) v =  40.0f;
+                    if (v > 100.0f) v = 100.0f;
+                    loudness_ref_spl = v;
+                    loudness_recompute_pending = true;
+                }
+                break;
+            case REQ_SET_LOUDNESS_INTENSITY:
+                if (vendor_last_wLength >= 4) {
+                    float v; memcpy(&v, vendor_rx_buf, 4);
+                    if (v <   0.0f) v =   0.0f;
+                    if (v > 200.0f) v = 200.0f;
+                    loudness_intensity_pct = v;
+                    loudness_recompute_pending = true;
+                }
+                break;
+
+            case REQ_SET_CROSSFEED:
+                if (vendor_last_wLength >= 1) {
+                    crossfeed_config.enabled = (vendor_rx_buf[0] != 0);
+                    crossfeed_update_pending = true;
+                }
+                break;
+            case REQ_SET_CROSSFEED_PRESET:
+                if (vendor_last_wLength >= 1) {
+                    uint8_t p = vendor_rx_buf[0];
+                    if (p <= CROSSFEED_PRESET_CUSTOM) {
+                        crossfeed_config.preset = p;
+                        crossfeed_update_pending = true;
+                    }
+                }
+                break;
+            case REQ_SET_CROSSFEED_FREQ:
+                if (vendor_last_wLength >= 4) {
+                    float v; memcpy(&v, vendor_rx_buf, 4);
+                    if (v < CROSSFEED_FREQ_MIN) v = CROSSFEED_FREQ_MIN;
+                    if (v > CROSSFEED_FREQ_MAX) v = CROSSFEED_FREQ_MAX;
+                    crossfeed_config.custom_fc = v;
+                    if (crossfeed_config.preset == CROSSFEED_PRESET_CUSTOM)
+                        crossfeed_update_pending = true;
+                }
+                break;
+            case REQ_SET_CROSSFEED_FEED:
+                if (vendor_last_wLength >= 4) {
+                    float v; memcpy(&v, vendor_rx_buf, 4);
+                    if (v < CROSSFEED_FEED_MIN) v = CROSSFEED_FEED_MIN;
+                    if (v > CROSSFEED_FEED_MAX) v = CROSSFEED_FEED_MAX;
+                    crossfeed_config.custom_feed_db = v;
+                    if (crossfeed_config.preset == CROSSFEED_PRESET_CUSTOM)
+                        crossfeed_update_pending = true;
+                }
+                break;
+            case REQ_SET_CROSSFEED_ITD:
+                if (vendor_last_wLength >= 1) {
+                    crossfeed_config.itd_enabled = (vendor_rx_buf[0] != 0);
+                    crossfeed_update_pending = true;
+                }
+                break;
+
+            case REQ_SET_LEVELLER_ENABLE:
+                if (vendor_last_wLength >= 1) {
+                    leveller_config.enabled = (vendor_rx_buf[0] != 0);
+                    leveller_update_pending = true;
+                    leveller_reset_pending  = true;
+                }
+                break;
+            case REQ_SET_LEVELLER_AMOUNT:
+                if (vendor_last_wLength >= 4) {
+                    float v; memcpy(&v, vendor_rx_buf, 4);
+                    if (v < LEVELLER_AMOUNT_MIN) v = LEVELLER_AMOUNT_MIN;
+                    if (v > LEVELLER_AMOUNT_MAX) v = LEVELLER_AMOUNT_MAX;
+                    leveller_config.amount = v;
+                    leveller_update_pending = true;
+                }
+                break;
+            case REQ_SET_LEVELLER_SPEED:
+                if (vendor_last_wLength >= 1) {
+                    uint8_t s = vendor_rx_buf[0];
+                    if (s < LEVELLER_SPEED_COUNT) {
+                        leveller_config.speed = s;
+                        leveller_update_pending = true;
+                    }
+                }
+                break;
+            case REQ_SET_LEVELLER_MAX_GAIN:
+                if (vendor_last_wLength >= 4) {
+                    float v; memcpy(&v, vendor_rx_buf, 4);
+                    if (v < LEVELLER_MAX_GAIN_MIN) v = LEVELLER_MAX_GAIN_MIN;
+                    if (v > LEVELLER_MAX_GAIN_MAX) v = LEVELLER_MAX_GAIN_MAX;
+                    leveller_config.max_gain_db = v;
+                    leveller_update_pending = true;
+                }
+                break;
+            case REQ_SET_LEVELLER_LOOKAHEAD:
+                if (vendor_last_wLength >= 1) {
+                    leveller_config.lookahead = (vendor_rx_buf[0] != 0);
+                    leveller_update_pending = true;
+                    leveller_reset_pending  = true;
+                }
+                break;
 
             default:
                 /* Other SETs land here once their handlers arrive. */
