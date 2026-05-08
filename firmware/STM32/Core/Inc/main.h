@@ -4,25 +4,27 @@
 
 #include "stm32h7xx_hal.h"
 
-/* Pin choices for M0 — see Documentation/Porting/STM32H723_first_steps.md §0.4
+/* Pin choices — see Documentation/Porting/STM32H723_first_steps.md §0.4
  *
- * PE3  — on-board BLUE_LED via PNP transistor (PDTC114ET). ACTIVE LOW:
- *        drive PE3 low to light the LED. After GPIO init the ODR is 0 by
- *        default, so the LED comes up ON immediately — first useful sign
- *        of life. Toggle then alternates ON/OFF at 1 Hz.
+ * PB5  — heartbeat LED (free header pin, externally wired with a series
+ *        resistor; ACTIVE HIGH — LED lights when PB5 is driven high).
+ *        Moved here from PE3 in M5 because PE3 became SAI1_SD_B (the
+ *        only LQFP100 pin available for that signal). The on-board
+ *        BLUE_LED no longer functions as a heartbeat indicator.
  *
- *        TODO(M5): PE3 is the only LQFP100 pin available for SAI1_SD_B
- *        per plan §0.4. When 4-channel audio comes online this heartbeat
- *        must move to a free header pin (e.g. PB5, PA15, PC6) or be
- *        retired entirely.
+ * PE3  — SAI1_SD_B (used by audio_out.c since M5).
+ * PE2  — SAI1_MCK_A
+ * PE4  — SAI1_FS_A
+ * PE5  — SAI1_SCK_A
+ * PE6  — SAI1_SD_A
  *
  * PA9  — USART1 TX (header pin, also documented in the WeAct README).
  * PA10 — USART1 RX (header pin).
  */
-#define HEARTBEAT_LED_PORT      GPIOE
-#define HEARTBEAT_LED_PIN       GPIO_PIN_3
-#define HEARTBEAT_LED_RCC_EN()  __HAL_RCC_GPIOE_CLK_ENABLE()
-#define HEARTBEAT_LED_ACTIVE_LOW 1
+#define HEARTBEAT_LED_PORT       GPIOB
+#define HEARTBEAT_LED_PIN        GPIO_PIN_5
+#define HEARTBEAT_LED_RCC_EN()   __HAL_RCC_GPIOB_CLK_ENABLE()
+#define HEARTBEAT_LED_ACTIVE_LOW 0
 
 #define LOG_USART               USART1
 #define LOG_USART_RCC_EN()      __HAL_RCC_USART1_CLK_ENABLE()
