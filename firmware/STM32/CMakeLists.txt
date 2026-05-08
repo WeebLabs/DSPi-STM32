@@ -20,7 +20,7 @@ project(DSPi_stm32h723 C ASM)
 # Find CMSIS device + HAL drivers we need for M0 (audio peripherals come later)
 find_package(CMSIS COMPONENTS STM32H723VG_M7 REQUIRED)
 find_package(HAL   COMPONENTS STM32H7_M7
-                              RCC GPIO CORTEX PWR FLASH UART DMA SAI
+                              RCC GPIO CORTEX PWR FLASH UART DMA SAI ADC
                    REQUIRED)
 
 set(EXE DSPi_stm32h723)
@@ -40,6 +40,8 @@ add_executable(${EXE}
     Core/Src/usb_audio.c
     Core/Src/vendor_commands.c
     Core/Src/audio_out.c
+    # M7g: internal sensors (ADC3 temp + VREFINT)
+    Core/Src/temp_sensor.c
     # M7b: DSP-pipeline state + portable DSP source files
     Core/Src/audio_state.c
     Core/Src/audio_input.c
@@ -94,6 +96,8 @@ target_link_libraries(${EXE} PRIVATE
     HAL::STM32::H7::M7::UART
     HAL::STM32::H7::M7::DMA
     HAL::STM32::H7::M7::SAI
+    HAL::STM32::H7::M7::ADC      # M7g — internal temp sensor + VREFINT
+    HAL::STM32::H7::M7::ADCEx
     CMSIS::STM32::H723VG::M7
     STM32::NoSys
 )

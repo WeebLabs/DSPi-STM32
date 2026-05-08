@@ -15,6 +15,7 @@
 #include <string.h>
 #include <math.h>
 
+#include "stm32h7xx_hal.h"   /* HAL_RCC_GetSysClockFreq for REQ_GET_STATUS w=13 */
 #include "tusb.h"
 #include "config.h"
 #include "vendor_commands.h"
@@ -154,6 +155,31 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                         return tud_control_xfer(rhport,
                                                 (tusb_control_request_t *)req,
                                                 &rate, 4);
+                    }
+                    /* M7g — system stats Console polls per-second:
+                     *   13: SYSCLK (Hz) — 550 MHz on STM32H723 at VOS0
+                     *   14: Vdda  (mV) — back-computed from VREFINT
+                     *   16: Tj    (centi-°C) — internal temp sensor
+                     */
+                    if (req->wValue == 13) {
+                        static uint32_t hz;
+                        hz = HAL_RCC_GetSysClockFreq();
+                        return tud_control_xfer(rhport,
+                                                (tusb_control_request_t *)req,
+                                                &hz, 4);
+                    }
+                    /* wValue=14 (Vdda mV) intentionally falls through to
+                     * STALL — Console treats a failed request as "feature
+                     * not supported" and hides the field. STM32H7's Vdda is
+                     * pin-bonded to 3.3 V on this board, so a back-computed
+                     * value adds noise without information. */
+                    if (req->wValue == 16) {
+                        extern int16_t read_temperature_cdeg(void);
+                        static int32_t cdeg;
+                        cdeg = (int32_t)read_temperature_cdeg();
+                        return tud_control_xfer(rhport,
+                                                (tusb_control_request_t *)req,
+                                                &cdeg, 4);
                     }
                     return false;
                 }
@@ -406,9 +432,27 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
 
                 /* ---- Identification ---- */
                 case REQ_GET_SERIAL: {
-                    /* 16-byte ASCII serial. Use the same string Console
-                     * shows in System Info; padded with zeros. */
-                    static uint8_t serial[16] = "0001";
+                    /* M7g — 16-byte ASCII hex serial derived from the H7's
+                     * 96-bit unique device ID at 0x1FF1E800. We encode the
+                     * low 64 bits (8 bytes) as 16 hex chars — uniqueness is
+                     * already guaranteed by the factory programming. The
+                     * full 96-bit ID would need 24 chars, more than the
+                     * Console's 16-byte buffer; the upper 32 bits are
+                     * mostly wafer/lot info and rarely change between
+                     * adjacent dies, so dropping them costs ~no entropy in
+                     * practice. */
+                    static uint8_t serial[16];
+                    static int     serial_built = 0;
+                    if (!serial_built) {
+                        const uint32_t *uid = (const uint32_t *)0x1FF1E800UL;
+                        uint64_t lo64 = ((uint64_t)uid[1] << 32) | uid[0];
+                        static const char hex[] = "0123456789ABCDEF";
+                        for (int i = 0; i < 16; ++i) {
+                            int shift = (15 - i) * 4;
+                            serial[i] = hex[(lo64 >> shift) & 0xF];
+                        }
+                        serial_built = 1;
+                    }
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req,
                                             serial, sizeof(serial));
