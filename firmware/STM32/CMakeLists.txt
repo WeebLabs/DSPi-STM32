@@ -38,6 +38,7 @@ add_executable(${EXE}
     Core/Src/usb_descriptors.c
     Core/Src/usb_glue.c
     Core/Src/usb_audio.c
+    Core/Src/vendor_commands.c
     Core/Src/audio_out.c
     # TinyUSB sources — kept as an explicit list so the milestone scope is
     # obvious. M3: device stack + dwc2 only — no built-in class drivers

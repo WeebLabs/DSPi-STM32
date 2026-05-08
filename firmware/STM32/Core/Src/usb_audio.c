@@ -108,6 +108,7 @@ static struct {
     uint8_t cur_alt;       /* current AS alt setting (0 = idle, 1 = 16-bit/48k) */
     bool    ep_data_open;
     bool    ep_fb_open;
+    bool    notify_ep_open; /* M7a: bulk IN 0x83 on the vendor interface */
     uint8_t pending_cs;    /* class-request SETUP scratch */
     uint8_t pending_recipient;
     uint8_t pending_len;
@@ -148,6 +149,28 @@ static void uac1_reset(uint8_t rhport) {
 static uint16_t uac1_open(uint8_t rhport,
                           tusb_desc_interface_t const *itf_desc,
                           uint16_t max_len) {
+    /* Second-call path: vendor interface (class 0xFF). TinyUSB calls
+     * open() again for it after AC+AS are claimed because the IAD only
+     * groups the audio function — the vendor itf is a sibling. We claim
+     * it, open the bulk IN notify EP if present, and return the byte
+     * count consumed (std itf descriptor + std EP descriptor). */
+    if (itf_desc->bInterfaceClass == 0xFF
+        && itf_desc->bAlternateSetting == 0) {
+        uint16_t drv_len = itf_desc->bLength;
+        if (itf_desc->bNumEndpoints >= 1) {
+            uint8_t const *p_ep = (uint8_t const *)itf_desc + drv_len;
+            if (p_ep[1] == TUSB_DESC_ENDPOINT) {
+                tusb_desc_endpoint_t const *ep_desc =
+                    (tusb_desc_endpoint_t const *)p_ep;
+                if (usbd_edpt_open(rhport, ep_desc)) {
+                    uac1.notify_ep_open = true;
+                }
+                drv_len += p_ep[0];
+            }
+        }
+        return drv_len;
+    }
+
     if (itf_desc->bInterfaceClass != TUSB_CLASS_AUDIO) return 0;
     /* The first interface in our function is the AC interface (alt 0). */
     if (itf_desc->bInterfaceSubClass != AUDIO_SUBCLASS_CONTROL) return 0;

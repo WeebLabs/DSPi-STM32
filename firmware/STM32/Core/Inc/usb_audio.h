@@ -35,7 +35,17 @@
 /* Interface numbering — order is what the descriptor declares them */
 #define ITF_NUM_AC              0   /* AudioControl */
 #define ITF_NUM_AS              1   /* AudioStreaming */
-#define ITF_NUM_TOTAL           2
+#define ITF_NUM_VENDOR          2   /* Vendor-class control + notify EP (M7a) */
+#define ITF_NUM_TOTAL           3
+
+/* Notification (device → host) bulk IN endpoint on the vendor interface.
+ * 64-byte FS bulk packets carry asynchronous status events (peak meters,
+ * audio source change, lock state, etc.) that the host polls when ready.
+ * bInterval is ignored for bulk on FS — set to 0 to match the RP build's
+ * convention. */
+#define NOTIFY_IN_ENDPOINT      0x83U
+#define NOTIFY_EP_MAX_PKT       64U
+#define NOTIFY_EP_INTERVAL_MS   0U
 
 /* M3 stats — exposed for the heartbeat printf. */
 extern volatile uint32_t audio_bytes_received;

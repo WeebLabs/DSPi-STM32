@@ -73,13 +73,14 @@ uint8_t const *tud_descriptor_device_cb(void) {
 #define U16_LE(x)   ((x) & 0xFF), (((x) >> 8) & 0xFF)
 #define U24_LE(x)   ((x) & 0xFF), (((x) >> 8) & 0xFF), (((x) >> 16) & 0xFF)
 
-#define CONFIG_TOTAL_LEN 127
+/* M7a: vendor interface (itf 2, 9 B) + std bulk IN notify EP (7 B) appended. */
+#define CONFIG_TOTAL_LEN 143
 
 static uint8_t const desc_configuration[CONFIG_TOTAL_LEN] = {
     /* ---- 0: Configuration ---- */
     9, TUSB_DESC_CONFIGURATION,
     U16_LE(CONFIG_TOTAL_LEN),
-    ITF_NUM_TOTAL,            /* bNumInterfaces (AC + AS) */
+    ITF_NUM_TOTAL,            /* bNumInterfaces (AC + AS + Vendor) */
     1,                        /* bConfigurationValue */
     0,                        /* iConfiguration */
     0x80,                     /* bmAttributes — bus-powered, no remote wakeup */
@@ -209,6 +210,21 @@ static uint8_t const desc_configuration[CONFIG_TOTAL_LEN] = {
     1,                        /* bInterval (1 ms) */
     2,                        /* bRefresh — host polls every 2^2 ms */
     0,                        /* bSynchAddress */
+
+    /* ---- 127: Vendor std interface (itf 2, 1 EP, class 0xFF) ---- */
+    9, TUSB_DESC_INTERFACE,
+    ITF_NUM_VENDOR, 0, 1,     /* itf number, alt, num EPs (notify) */
+    0xFF,                     /* bInterfaceClass: vendor specific */
+    0x00,                     /* bInterfaceSubClass */
+    0x00,                     /* bInterfaceProtocol */
+    0x00,                     /* iInterface */
+
+    /* ---- 136: Std bulk IN notification EP (0x83, 64 B FS bulk) ---- */
+    7, TUSB_DESC_ENDPOINT,
+    NOTIFY_IN_ENDPOINT,
+    TUSB_XFER_BULK,           /* bmAttributes (0x02 — bulk) */
+    U16_LE(NOTIFY_EP_MAX_PKT),
+    NOTIFY_EP_INTERVAL_MS,
 };
 
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
