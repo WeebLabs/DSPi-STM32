@@ -225,7 +225,14 @@ void dsp_update_delay_samples(float sample_rate) {
         }
 
         int32_t samples = (int32_t)(delay_ms * sample_rate / 1000.0f);
-        if (samples > MAX_DELAY_SAMPLES) samples = MAX_DELAY_SAMPLES;
+        /* Clamp to MAX_DELAY_SAMPLES - 1 (NOT to MAX_DELAY_SAMPLES). With
+         * MAX_DELAY_MASK = MAX_DELAY_SAMPLES - 1, a delay of *exactly*
+         * MAX_DELAY_SAMPLES makes (widx - dly) & MAX_DELAY_MASK == widx
+         * (the read/write indices coincide) and the delay loop degenerates
+         * into pass-through. Clamping at MAX-1 keeps the read index
+         * permanently 1 sample ahead of the write so the line stays
+         * functional even at the upper bound. */
+        if (samples > MAX_DELAY_SAMPLES - 1) samples = MAX_DELAY_SAMPLES - 1;
         if (samples < 0) samples = 0;
         channel_delay_samples[out] = samples;
 

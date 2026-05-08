@@ -24,8 +24,19 @@
 #include "tusb.h"
 #include "usb_audio.h"
 #include "dsp_pipeline.h"
+#include "bulk_params.h"
 #include <stdio.h>
 #include <string.h>
+
+/* Bulk-params consumer plumbing — vendor_commands.c stages the buffer +
+ * sets the pending flag from the USB IRQ; the main loop drains it so the
+ * heavy bulk_params_apply / dsp_recalculate_all_filters work doesn't
+ * happen in IRQ context. Mirrors the RP main.c pattern. */
+extern volatile bool bulk_params_pending;
+extern uint8_t bulk_param_buf[];
+extern volatile bool crossfeed_update_pending;
+extern volatile bool leveller_update_pending;
+extern volatile bool leveller_reset_pending;
 
 UART_HandleTypeDef huart_log;
 
@@ -115,6 +126,27 @@ int main(void) {
     bool was_ever_mounted = false;
     for (;;) {
         USB_Task();
+
+        /* Drain bulk-params SETs deferred from the USB IRQ. Console funnels
+         * a lot of parameter changes (delays, master vol, leveller, etc.)
+         * through REQ_SET_ALL_PARAMS rather than the per-param SETs, so
+         * without this consumer the bulk transfer arrives, lands in
+         * bulk_param_buf, and silently rots — the user-visible symptom is
+         * "Console sliders move but nothing changes on the device." */
+        if (bulk_params_pending) {
+            bulk_params_pending = false;
+            float rate = (float)audio_state.freq;
+            /* include_pins=false on STM32 — pin assignments are fixed
+             * by the board layout (SAI on PE2..6); ignore preset pin
+             * config so a Console preset with RP-style pin numbers
+             * can't accidentally repurpose our SAI pins. */
+            bulk_params_apply((const WireBulkParams *)bulk_param_buf,
+                              false /* include_pins */);
+            dsp_recalculate_all_filters(rate);  /* also calls dsp_update_delay_samples */
+            crossfeed_update_pending = true;
+            leveller_update_pending  = true;
+            leveller_reset_pending   = true;
+        }
 
         uint32_t now = HAL_GetTick();
         bool mounted = tud_mounted();

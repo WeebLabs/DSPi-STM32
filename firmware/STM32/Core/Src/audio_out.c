@@ -95,6 +95,14 @@ extern volatile LevellerConfig  leveller_config;
 extern volatile bool            leveller_update_pending;
 extern volatile bool            leveller_reset_pending;
 
+/* M7d: per-output delay lines (defined in dsp_pipeline.c). delay_lines is
+ * indexed by output number (0..NUM_DELAY_CHANNELS-1), NOT by global channel
+ * index — channel_delays_ms[CH_OUT_1+out] is the user-facing field. */
+extern float    delay_lines[NUM_DELAY_CHANNELS][MAX_DELAY_SAMPLES];
+extern uint32_t delay_write_idx;
+extern int32_t  channel_delay_samples[NUM_DELAY_CHANNELS];
+extern bool     any_delay_active;
+
 /* Local DSP state (zeroed on init by Audio_Init). */
 static CrossfeedState crossfeed_state;
 static LevellerState  leveller_state;
@@ -213,6 +221,42 @@ static void fill_half(int32_t *dst) {
                                   AUDIO_FRAMES_HALF, EQ_CH_OUT0);
         dsp_process_channel_block(filters[EQ_CH_OUT1], buf_o1,
                                   AUDIO_FRAMES_HALF, EQ_CH_OUT1);
+    }
+
+    /* === Stage 6.5: per-output delay (circular delay-line, mirrors RP
+     *                ordering — runs AFTER per-output EQ but BEFORE the
+     *                gain stage so latency-correction tracks the EQ-shaped
+     *                signal). Each output has its own delay line; both
+     *                start from the SAME delay_write_idx, so we snapshot
+     *                it, run output 0 with widx0, output 1 with widx1, and
+     *                advance the global index ONCE at the end (matching
+     *                audio_pipeline.c's pattern). With dly==0 we skip
+     *                entirely — leaves the previously-captured tail in
+     *                the delay line for re-engagement; the buffer is
+     *                large enough (MAX_DELAY_SAMPLES samples) that this
+     *                is harmless. */
+    if (any_delay_active) {
+        const int32_t dly0 = channel_delay_samples[0];
+        const int32_t dly1 = channel_delay_samples[1];
+        if (dly0 > 0) {
+            float *dline = delay_lines[0];
+            uint32_t widx = delay_write_idx;
+            for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
+                dline[widx] = buf_o0[k];
+                buf_o0[k]   = dline[(widx - dly0) & MAX_DELAY_MASK];
+                widx = (widx + 1) & MAX_DELAY_MASK;
+            }
+        }
+        if (dly1 > 0) {
+            float *dline = delay_lines[1];
+            uint32_t widx = delay_write_idx;
+            for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
+                dline[widx] = buf_o1[k];
+                buf_o1[k]   = dline[(widx - dly1) & MAX_DELAY_MASK];
+                widx = (widx + 1) & MAX_DELAY_MASK;
+            }
+        }
+        delay_write_idx = (delay_write_idx + AUDIO_FRAMES_HALF) & MAX_DELAY_MASK;
     }
 
     /* === Stage 7: per-output gain + master volume + clamp + 24-bit

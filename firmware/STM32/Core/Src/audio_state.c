@@ -131,6 +131,12 @@ volatile SystemStatusPacket global_status = { 0 };
 /* -------- Other globals the DSP files reach for -------- */
 volatile bool bypass_master_eq = false;
 
+/* SPDIF RX pin-change pending — referenced by imported bulk_params.c when
+ * Console SETs the SPDIF input pin via REQ_SET_ALL_PARAMS. STM32 has no
+ * SPDIF RX yet (deferred per project plan); the flag is harmless and
+ * read by nothing in this build. Will become live in M9 SPDIF RX. */
+volatile bool spdif_rx_pin_change_pending = false;
+
 /* -------- Stub: master volume update --------
  * Wired to the real SAI output-gain stage in M7c. For M7b we just clamp,
  * store, and accept the value so bulk_params SETs don't fail. The

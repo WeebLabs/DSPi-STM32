@@ -84,6 +84,11 @@ extern volatile uint32_t nominal_feedback_10_14;
 // runs copy_to_ram, so the delay arrays (NUM_DELAY_CHANNELS × MAX_DELAY_SAMPLES
 // × 4 bytes) compete directly with text/heap.  Keep RP2040 at 21 ms; RP2350
 // has ample SRAM for the longer window.
+/* TODO (M6c custom linker script): add an AXISRAM region (320 KB at
+ * 0x24000000) and place delay_lines there with a section attribute, then
+ * raise STM32 MAX_DELAY_SAMPLES to 8192 (~170 ms). Currently the linker
+ * only declares the 128 KB DTCM as RAM; delay_lines competes for that
+ * budget so we cap at 2048 like RP2350. */
 #if PICO_RP2350 || defined(STM32H723xx)
 #define MAX_DELAY_SAMPLES 2048   // 42 ms at 48 kHz
 #else

@@ -49,6 +49,8 @@ extern volatile float channel_gain_linear[3];
 extern volatile int32_t channel_gain_mul [3];
 extern volatile bool  channel_mute       [3];
 extern float channel_delays_ms[NUM_CHANNELS];
+extern int32_t channel_delay_samples[NUM_DELAY_CHANNELS];
+extern bool    any_delay_active;
 extern uint8_t output_types[NUM_SPDIF_INSTANCES];
 extern uint8_t output_pins[NUM_PIN_OUTPUTS];
 extern uint8_t  i2s_bck_pin;
@@ -77,7 +79,9 @@ static void update_preamp_ch(uint8_t ch, float db) {
 /* Bulk SET payload buffer — sized for one WireBulkParams transfer.
  * tud_control_xfer chunks the actual EP0 transfers; the application
  * just provides one contiguous buffer of wLength bytes. */
-static uint8_t __attribute__((aligned(4))) bulk_param_buf[sizeof(WireBulkParams)];
+/* bulk_param_buf is non-static — main.c drains it from the main loop after
+ * REQ_SET_ALL_PARAMS deposits a full state via tud_control_xfer. */
+uint8_t __attribute__((aligned(4))) bulk_param_buf[sizeof(WireBulkParams)];
 
 /* Set on the SET-side ACK stage; the main loop checks and calls
  * bulk_params_apply() when true (M7c will hook the main loop into
@@ -283,6 +287,26 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     static float v; v = leveller_config.gate_threshold_db;
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 4);
+                }
+                case 0xFE: {  /* DEBUG: dump delay-stage internal state */
+                    static struct __attribute__((packed)) {
+                        int32_t  ds0;       /* channel_delay_samples[0]   */
+                        int32_t  ds1;       /* channel_delay_samples[1]   */
+                        uint8_t  active;    /* any_delay_active           */
+                        uint8_t  pad[3];
+                        uint32_t freq;      /* audio_state.freq           */
+                        float    ms_out0;   /* channel_delays_ms[CH_OUT_1]*/
+                        float    ms_out1;   /* channel_delays_ms[CH_OUT_2]*/
+                    } d;
+                    d.ds0     = channel_delay_samples[0];
+                    d.ds1     = channel_delay_samples[1];
+                    d.active  = any_delay_active ? 1 : 0;
+                    d.freq    = audio_state.freq;
+                    d.ms_out0 = channel_delays_ms[CH_OUT_1];
+                    d.ms_out1 = channel_delays_ms[CH_OUT_2];
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &d, sizeof(d));
                 }
 
                 case REQ_GET_MATRIX_ROUTE: {
@@ -586,7 +610,19 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 if (out < NUM_OUTPUT_CHANNELS && vendor_last_wLength >= 4) {
                     float ms;
                     memcpy(&ms, vendor_rx_buf, 4);
+                    if (ms < 0) ms = 0;
+                    /* Two storages, must stay in sync (matches bulk_params_apply):
+                     *   - matrix_mixer.outputs[out].delay_ms — surfaced via
+                     *     REQ_GET_OUTPUT_DELAY and the bulk wire format
+                     *   - channel_delays_ms[CH_OUT_1 + out] — what
+                     *     dsp_update_delay_samples actually reads to compute
+                     *     the per-output sample counts the audio path uses
+                     * The earlier impl wrote only the first field, so Console's
+                     * output-delay slider was a silent no-op even though the
+                     * GET round-tripped fine. */
                     matrix_mixer.outputs[out].delay_ms = ms;
+                    channel_delays_ms[CH_OUT_1 + out]  = ms;
+                    dsp_update_delay_samples((float)audio_state.freq);
                 }
                 break;
             }
@@ -626,8 +662,9 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     float ms; memcpy(&ms, vendor_rx_buf, 4);
                     if (ms < 0) ms = 0;
                     channel_delays_ms[ch] = ms;
-                    /* dsp_update_delay_samples deferred — delays don't apply
-                     * to audio yet (no delay-line stage in fill_half). */
+                    /* Recompute delay-sample counts + any_delay_active bypass
+                     * flag for fill_half's Stage 6.5 delay-line stage. */
+                    dsp_update_delay_samples((float)audio_state.freq);
                 }
                 break;
             }
