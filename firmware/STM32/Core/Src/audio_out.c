@@ -157,7 +157,14 @@ static void fill_half(int32_t *dst) {
      * once per buffer-half so the per-sample loops stay branch-light. */
     float preamp_l = global_preamp_linear[0];
     float preamp_r = global_preamp_linear[1];
-    float master   = master_volume_linear;
+    /* M7h: composite output gain = host volume (UAC1) × master volume.
+     * audio_state.vol_mul is Q15 (32768 = unity); convert once per buffer
+     * -half. audio_state.mute folded in as a hard 0 multiplier — host's
+     * mute key always wins over the slider. */
+    float host_vol = audio_state.mute
+                     ? 0.0f
+                     : (float)audio_state.vol_mul * (1.0f / 32768.0f);
+    float master   = host_vol * master_volume_linear;
     bool  eq_bypass = bypass_master_eq;
     bool  cf_active = crossfeed_config.enabled;
     bool  lv_active = leveller_config.enabled;

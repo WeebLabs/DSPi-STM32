@@ -257,11 +257,15 @@ static bool handle_get_request(uint8_t stage, tusb_control_request_t const *req)
 
         if (entity_id == UAC1_FEATURE_UNIT_ID && cn == 0) {
             if (cs == AUDIO_FU_CTRL_MUTE) {
-                static uint8_t v = 0;
+                static uint8_t v;
+                v = audio_state.mute ? 1 : 0;
                 return tud_control_xfer(0, (tusb_control_request_t *)req, &v, 1);
             }
             if (cs == AUDIO_FU_CTRL_VOLUME) {
-                static int16_t cur = 0, min = -90 * 256, max = 0, res = 256;
+                /* Static MIN/MAX/RES (constant), CUR reflects last SET so the
+                 * OS slider re-reads correctly across reconnects. */
+                static int16_t cur, min = -90 * 256, max = 0, res = 256;
+                cur = audio_state.volume;
                 switch (req->bRequest) {
                     case UAC1_REQ_GET_CUR: return tud_control_xfer(0, (tusb_control_request_t *)req, &cur, 2);
                     case UAC1_REQ_GET_MIN: return tud_control_xfer(0, (tusb_control_request_t *)req, &min, 2);
@@ -285,6 +289,42 @@ static bool handle_get_request(uint8_t stage, tusb_control_request_t const *req)
     return false;
 }
 
+/* Host-volume LUT — copy of RP db_to_vol[].  Index = integer dB above the
+ * silence floor (0 = silent, 60 = 0 dB unity).  Values are Q15 (0x8000 = 1.0).
+ * The table is psychoacoustically tapered (steeper near silence, gentler
+ * near 0 dB) to match what macOS / iOS feel like at each slider step. */
+static const uint16_t db_to_vol[61] = {
+    0x0000, 0x0025, 0x0029, 0x002e, 0x0034, 0x003a, 0x0041, 0x0049,
+    0x0052, 0x005c, 0x0068, 0x0074, 0x0082, 0x0092, 0x00a4, 0x00b8,
+    0x00cf, 0x00e8, 0x0104, 0x0124, 0x0148, 0x0170, 0x019d, 0x01cf,
+    0x0207, 0x0247, 0x028e, 0x02de, 0x0337, 0x039c, 0x040c, 0x048b,
+    0x0519, 0x05b8, 0x066a, 0x0733, 0x0814, 0x0910, 0x0a2b, 0x0b68,
+    0x0ccd, 0x0e5d, 0x101d, 0x1215, 0x1449, 0x16c3, 0x198a, 0x1ca8,
+    0x2027, 0x2413, 0x287a, 0x2d6b, 0x32f5, 0x392d, 0x4027, 0x47fb,
+    0x50c3, 0x5a9e, 0x65ad, 0x7215, 0x8000
+};
+#define CENTER_VOLUME_INDEX 60   /* index of unity gain (= 0 dB) */
+
+/* Decode the int16 UAC1 volume value (1/256 dB units, range -90..0 dB) into
+ * the Q15 vol_mul the audio path applies. The host can ship values from
+ * INT16_MIN..0; we clamp to the 60-step LUT and let the lower tail collapse
+ * to silence. Mirrors RP audio_set_volume() exactly. */
+void audio_set_volume(int16_t volume_db_x256) {
+    audio_state.volume = volume_db_x256;
+    int32_t v = (int32_t)volume_db_x256 + (CENTER_VOLUME_INDEX * 256);
+    if (v < 0) v = 0;
+    if (v >= (CENTER_VOLUME_INDEX + 1) * 256)
+        v = (CENTER_VOLUME_INDEX + 1) * 256 - 1;
+    uint8_t idx = (uint8_t)(((uint16_t)v) >> 8u);
+    audio_state.vol_mul = (int16_t)db_to_vol[idx];
+    /* TODO M7h: when loudness compensation lands, recompute the active
+     * loudness coefficient table here using `idx` as the volume index. */
+}
+
+void audio_set_mute(bool mute) {
+    audio_state.mute = mute;
+}
+
 static bool handle_set_request(uint8_t stage, tusb_control_request_t const *req) {
     /* SETUP — record what to expect and accept the data stage */
     if (stage == CONTROL_STAGE_SETUP) {
@@ -299,9 +339,22 @@ static bool handle_set_request(uint8_t stage, tusb_control_request_t const *req)
                                 uac1_ctrl_buf, uac1.pending_len);
     }
 
-    /* DATA / ACK — silently accept. M3 doesn't yet wire mute/volume to
-     * anything physical; later milestones will pull these out of
-     * uac1_ctrl_buf and update the DSP pipeline. */
+    /* DATA stage — pull the value Console / OS just wrote out of
+     * uac1_ctrl_buf and apply it. We only handle Feature Unit (volume +
+     * mute on master channel); other recipients fall through silently. */
+    if (stage == CONTROL_STAGE_DATA) {
+        if (uac1.pending_recipient == UAC1_FEATURE_UNIT_ID) {
+            if (uac1.pending_cs == AUDIO_FU_CTRL_VOLUME &&
+                uac1.pending_len >= 2) {
+                int16_t v;
+                memcpy(&v, uac1_ctrl_buf, 2);
+                audio_set_volume(v);
+            } else if (uac1.pending_cs == AUDIO_FU_CTRL_MUTE &&
+                       uac1.pending_len >= 1) {
+                audio_set_mute(uac1_ctrl_buf[0] != 0);
+            }
+        }
+    }
     return true;
 }
 

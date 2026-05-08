@@ -170,7 +170,16 @@ bool     i2s_mck_enabled    = false;
 uint16_t i2s_mck_multiplier = 128;
 
 /* -------- Audio state (top-level UI mirror) -------- */
-volatile AudioState audio_state = { .freq = 48000 };
+/* Default to unity gain (0 dB / 0x8000 Q15) on boot. Without this audio_state
+ * lands in BSS as zero — vol_mul=0 means muted, so until the host sends a
+ * SET_CUR(volume) the device would be silent at boot. The OS will overwrite
+ * with its remembered slider position within ~100 ms of enumeration. */
+volatile AudioState audio_state = {
+    .freq    = 48000,
+    .volume  = 0,        /* 0 dB */
+    .vol_mul = 0x7FFF,   /* unity Q15 (matches CENTER_VOLUME_INDEX) */
+    .mute    = false,
+};
 
 /* -------- System status packet (REQ_GET_STATUS combined response) --------
  * Console polls this for peak meters, CPU load, clip flags. M7d ships
