@@ -279,6 +279,11 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 1);
                 }
+                case REQ_GET_LEVELLER_GATE: {
+                    static float v; v = leveller_config.gate_threshold_db;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
 
                 case REQ_GET_MATRIX_ROUTE: {
                     uint8_t in_  = (req->wValue >> 8) & 0xFF;
@@ -749,6 +754,15 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     leveller_config.lookahead = (vendor_rx_buf[0] != 0);
                     leveller_update_pending = true;
                     leveller_reset_pending  = true;
+                }
+                break;
+            case REQ_SET_LEVELLER_GATE:
+                if (vendor_last_wLength >= 4) {
+                    float v; memcpy(&v, vendor_rx_buf, 4);
+                    if (v < LEVELLER_GATE_MIN) v = LEVELLER_GATE_MIN;
+                    if (v > LEVELLER_GATE_MAX) v = LEVELLER_GATE_MAX;
+                    leveller_config.gate_threshold_db = v;
+                    leveller_update_pending = true;
                 }
                 break;
 

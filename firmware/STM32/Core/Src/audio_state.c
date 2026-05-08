@@ -50,8 +50,18 @@ volatile bool   loudness_recompute_pending  = false;
 volatile CrossfeedConfig crossfeed_config       = { 0 };
 volatile bool            crossfeed_update_pending = false;
 
-/* -------- Leveller -------- */
-volatile LevellerConfig leveller_config        = { 0 };
+/* -------- Leveller --------
+ * Defaults: enabled=false (must be turned on by Console), but
+ * amount/max_gain/gate seeded so that flipping enable produces an
+ * audible effect immediately without further tweaking. */
+volatile LevellerConfig leveller_config = {
+    .enabled           = false,
+    .amount            = 100.0f,    /* full upward compression ratio (20:1) */
+    .speed             = 1,         /* medium attack/release */
+    .max_gain_db       = 15.0f,     /* +15 dB ceiling on upward gain */
+    .lookahead         = false,
+    .gate_threshold_db = -96.0f,    /* effectively no gate */
+};
 volatile bool           leveller_update_pending = false;
 volatile bool           leveller_reset_pending  = false;
 
