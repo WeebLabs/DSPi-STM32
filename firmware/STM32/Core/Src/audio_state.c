@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>   /* snprintf for default channel names */
 
 /* -------- Per-input-channel preamp -------- */
 volatile float    global_preamp_db    [NUM_INPUT_CHANNELS] = { 0 };
@@ -98,8 +99,57 @@ void matrix_init_defaults(void) {
     }
 }
 
-/* -------- Channel names (per-preset, user-editable) -------- */
+/* Forward decl — defined further down. Needed here because
+ * init_default_channel_names() consults it for SPDIF/I2S labels. */
+extern uint8_t output_types[NUM_SPDIF_INSTANCES];
+
+/* -------- Channel names (per-preset, user-editable) --------
+ * Zero-init at boot; init_default_channel_names() populates with the
+ * canonical "USB L/R" / "SPDIF n L/R" / "PDM" labels Console uses when
+ * no preset overrides them. Mirrors the RP get_default_channel_name
+ * scheme exactly so a preset .json snapshot from one platform reads
+ * naturally on the other. */
 char channel_names[NUM_CHANNELS][PRESET_NAME_LEN];
+
+void get_default_channel_name(int ch, uint8_t input_source,
+                              const uint8_t *out_types, char *buf) {
+    memset(buf, 0, PRESET_NAME_LEN);
+    if (ch < 0 || ch >= NUM_CHANNELS) return;
+
+    if (ch < NUM_INPUT_CHANNELS) {
+        const char *prefix;
+        switch (input_source) {
+            case INPUT_SOURCE_SPDIF: prefix = "SPDIF"; break;
+            case INPUT_SOURCE_USB:
+            default:                 prefix = "USB";   break;
+        }
+        snprintf(buf, PRESET_NAME_LEN, "%s %c", prefix, (ch == 0) ? 'L' : 'R');
+        return;
+    }
+
+    if (ch == NUM_CHANNELS - 1) {
+        strncpy(buf, "PDM", PRESET_NAME_LEN - 1);
+        return;
+    }
+
+    int slot_idx = (ch - NUM_INPUT_CHANNELS) / 2;
+    int side     = (ch - NUM_INPUT_CHANNELS) % 2;
+    uint8_t type = (out_types && slot_idx < NUM_SPDIF_INSTANCES)
+                       ? out_types[slot_idx]
+                       : OUTPUT_TYPE_SPDIF;
+    const char *prefix = (type == OUTPUT_TYPE_I2S) ? "I2S" : "SPDIF";
+    snprintf(buf, PRESET_NAME_LEN, "%s %d %c",
+             prefix, slot_idx + 1, (side == 0) ? 'L' : 'R');
+}
+
+void init_default_channel_names(void) {
+    for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
+        get_default_channel_name(ch,
+                                 INPUT_SOURCE_USB,
+                                 output_types,
+                                 channel_names[ch]);
+    }
+}
 
 /* (filter_recipes[][], channel_delays_ms[], filters[][], delay_lines[][],
  *  channel_bypassed[], delay_write_idx, channel_delay_samples[],

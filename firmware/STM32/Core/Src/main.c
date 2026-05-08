@@ -85,6 +85,7 @@ int main(void) {
     dsp_init_default_filters();
     dsp_recalculate_all_filters(48000.0f);
     matrix_init_defaults();
+    init_default_channel_names();   /* "USB L/R", "SPDIF n L/R", "PDM" */
 
     Audio_Init();     /* SAI1_A + DMA1_Stream0 + sine table fill */
     Audio_Start();    /* kick off circular DMA — 1 kHz tone on PE6 SD */

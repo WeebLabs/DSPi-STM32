@@ -82,6 +82,12 @@ void update_master_volume(float db);
  * Console renders nothing. */
 void matrix_init_defaults(void);
 
+/* M7f: default channel labels Console expects on a fresh device:
+ * "USB L/R", "SPDIF/I2S n L/R" depending on output_types[], "PDM". */
+void init_default_channel_names(void);
+void get_default_channel_name(int ch, uint8_t input_source,
+                              const uint8_t *out_types, char *buf);
+
 /* USB→SAI ring (M6a). The UAC1 ISO OUT EP writes 16-bit stereo PCM
  * frames here; audio_out.c reads them out into the SAI ping-pong
  * buffer. One "frame" = one stereo pair = two int16 samples = 4 bytes.
