@@ -26,6 +26,10 @@ typedef struct { int32_t b0, b1, b2, a1, a2; bool bypass; } LoudnessCoeffs;
 extern LoudnessCoeffs loudness_tables[2][LOUDNESS_VOL_STEPS][LOUDNESS_BIQUAD_COUNT];
 extern LoudnessCoeffs (*loudness_active_table)[LOUDNESS_BIQUAD_COUNT];
 
+// Per-vol-step coefficient row picked by audio_set_volume(); the audio
+// path snapshots this at the top of each fill_half. NULL = bypass.
+extern const LoudnessCoeffs *current_loudness_coeffs;
+
 // Recompute the entire loudness table for current parameters
 // Called from main loop on: boot, ref SPL change, intensity change, sample rate change
 void loudness_recompute_table(float ref_spl, float intensity_pct, float sample_rate);

@@ -20,6 +20,7 @@
 
 #include "usb_audio.h"
 #include "usb_descriptors.h"
+#include "loudness.h"   /* current_loudness_coeffs / loudness_active_table */
 
 /* ---------------- Endpoint buffers ----------------
  * AUDIO_EP_MAX_PKT covers nominal + jitter at the highest format we'll
@@ -317,8 +318,12 @@ void audio_set_volume(int16_t volume_db_x256) {
         v = (CENTER_VOLUME_INDEX + 1) * 256 - 1;
     uint8_t idx = (uint8_t)(((uint16_t)v) >> 8u);
     audio_state.vol_mul = (int16_t)db_to_vol[idx];
-    /* TODO M7h: when loudness compensation lands, recompute the active
-     * loudness coefficient table here using `idx` as the volume index. */
+    /* M7i: re-key the loudness coefficient row to match the new volume.
+     * Tables aren't built yet on cold boot — gate on active_table being
+     * non-NULL so we don't dereference a null pointer here. */
+    if (loudness_active_table) {
+        current_loudness_coeffs = loudness_active_table[idx];
+    }
 }
 
 void audio_set_mute(bool mute) {

@@ -34,6 +34,7 @@
 #include "dsp_pipeline.h"  /* M7c: per-channel biquad EQ */
 #include "crossfeed.h"     /* M7d: BS2B crossfeed */
 #include "leveller.h"      /* M7d: volume leveller */
+#include "loudness.h"      /* M7i: loudness compensation */
 #include <math.h>          /* M7e: fabsf for level meters */
 
 /* ---- Single shared DMA ring in AXI SRAM (DMA1 cannot reach DTCM) ---- */
@@ -108,6 +109,13 @@ extern bool     any_delay_active;
  * Console polls REQ_GET_STATUS wValue=9 every ~30 ms; we just keep refreshing
  * the latest per-fill-half block peak in place — Console smooths visually. */
 extern volatile SystemStatusPacket global_status;
+
+/* M7i: loudness compensation — per-channel SVF state for the 2-biquad
+ * shelf cascade. State lives here (not in loudness.c) because it's a
+ * stateful run-time object that rolls samples; the imported loudness.c
+ * is pure coefficient computation. [0]=L, [1]=R. */
+static LoudnessSvfState loudness_state[2][LOUDNESS_BIQUAD_COUNT];
+extern volatile bool loudness_enabled;
 
 /* Local DSP state (zeroed on init by Audio_Init). */
 static CrossfeedState crossfeed_state;
@@ -199,6 +207,46 @@ static void fill_half(int32_t *dst) {
     for (; i < AUDIO_FRAMES_HALF; ++i) {
         buf_l[i] = 0.0f;
         buf_r[i] = 0.0f;
+    }
+
+    /* === Stage 1.5: loudness compensation (volume-aware shelf cascade).
+     *               Two SVF biquads per channel: low shelf (~50 Hz boost
+     *               at low volumes) + high shelf (~10 kHz boost). Boost
+     *               curve scales with how far below loudness_ref_spl the
+     *               host volume is. Coefficients re-keyed in
+     *               audio_set_volume() — current_loudness_coeffs points
+     *               into the pre-computed 61×2 LUT. */
+    bool loud_on = loudness_enabled;
+    const LoudnessCoeffs *loud_coeffs = current_loudness_coeffs;
+    if (loud_on && loud_coeffs) {
+        for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
+            float ml = buf_l[k];
+            float mr = buf_r[k];
+            for (int j = 0; j < LOUDNESS_BIQUAD_COUNT; ++j) {
+                const LoudnessCoeffs *lc = &loud_coeffs[j];
+                if (lc->bypass) continue;
+                LoudnessSvfState *st = &loudness_state[0][j];
+                float v3 = ml - st->ic2eq;
+                float v1 = lc->sva1 * st->ic1eq + lc->sva2 * v3;
+                float v2 = st->ic2eq + lc->sva2 * st->ic1eq + lc->sva3 * v3;
+                st->ic1eq = 2.0f * v1 - st->ic1eq;
+                st->ic2eq = 2.0f * v2 - st->ic2eq;
+                ml = lc->svm0 * ml + lc->svm1 * v1 + lc->svm2 * v2;
+            }
+            for (int j = 0; j < LOUDNESS_BIQUAD_COUNT; ++j) {
+                const LoudnessCoeffs *lc = &loud_coeffs[j];
+                if (lc->bypass) continue;
+                LoudnessSvfState *st = &loudness_state[1][j];
+                float v3 = mr - st->ic2eq;
+                float v1 = lc->sva1 * st->ic1eq + lc->sva2 * v3;
+                float v2 = st->ic2eq + lc->sva2 * st->ic1eq + lc->sva3 * v3;
+                st->ic1eq = 2.0f * v1 - st->ic1eq;
+                st->ic2eq = 2.0f * v2 - st->ic2eq;
+                mr = lc->svm0 * mr + lc->svm1 * v1 + lc->svm2 * v2;
+            }
+            buf_l[k] = ml;
+            buf_r[k] = mr;
+        }
     }
 
     /* === Stage 2: per-input EQ (block-based — uses dsp_process_channel

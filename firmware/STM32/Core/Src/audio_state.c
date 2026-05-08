@@ -45,7 +45,12 @@ volatile bool     channel_mute       [3] = { false };
 volatile bool   loudness_enabled            = false;
 volatile float  loudness_ref_spl            = 83.0f;
 volatile float  loudness_intensity_pct      = 100.0f;
-volatile bool   loudness_recompute_pending  = false;
+volatile bool   loudness_recompute_pending  = true;  /* compute at boot */
+/* Pointer to the current 2-biquad row (one per channel pair) inside the
+ * active loudness table. Re-keyed by audio_set_volume() on every host vol
+ * change; set NULL means "loudness inactive for this vol step", which the
+ * audio path treats as bypass. */
+const LoudnessCoeffs *current_loudness_coeffs = NULL;
 
 /* -------- Crossfeed -------- */
 volatile CrossfeedConfig crossfeed_config       = { 0 };

@@ -25,6 +25,7 @@
 #include "usb_audio.h"
 #include "dsp_pipeline.h"
 #include "bulk_params.h"
+#include "loudness.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -37,6 +38,10 @@ extern uint8_t bulk_param_buf[];
 extern volatile bool crossfeed_update_pending;
 extern volatile bool leveller_update_pending;
 extern volatile bool leveller_reset_pending;
+extern volatile bool loudness_recompute_pending;
+extern volatile float loudness_ref_spl;
+extern volatile float loudness_intensity_pct;
+extern void audio_set_volume(int16_t volume_db_x256);
 
 UART_HandleTypeDef huart_log;
 
@@ -144,9 +149,24 @@ int main(void) {
             bulk_params_apply((const WireBulkParams *)bulk_param_buf,
                               false /* include_pins */);
             dsp_recalculate_all_filters(rate);  /* also calls dsp_update_delay_samples */
-            crossfeed_update_pending = true;
-            leveller_update_pending  = true;
-            leveller_reset_pending   = true;
+            crossfeed_update_pending   = true;
+            leveller_update_pending    = true;
+            leveller_reset_pending     = true;
+            loudness_recompute_pending = true;
+        }
+
+        /* Loudness compensation: recompute the 61×2 coefficient table when
+         * any input changes (boot, ref SPL, intensity, sample rate, bulk
+         * SET). The compute is ~0.5 ms on H7 — too heavy for the audio IRQ
+         * but trivial here. After recompute we re-poke audio_set_volume
+         * with the cached host volume so current_loudness_coeffs picks up
+         * the freshly-computed row for the current vol step. */
+        if (loudness_recompute_pending) {
+            loudness_recompute_pending = false;
+            loudness_recompute_table((float)loudness_ref_spl,
+                                     (float)loudness_intensity_pct,
+                                     (float)audio_state.freq);
+            audio_set_volume(audio_state.volume);
         }
 
         uint32_t now = HAL_GetTick();
