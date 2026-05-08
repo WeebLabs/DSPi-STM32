@@ -617,6 +617,20 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     dsp_compute_coefficients(&filter_recipes[pkt.channel][pkt.band],
                                              &filters[pkt.channel][pkt.band],
                                              48000.0f);
+                    /* Push the entire WireBandParams (16 bytes) so Console
+                     * sees the type/freq/Q/gain change in one event. */
+                    WireBandParams wp = {
+                        .type    = pkt.type,
+                        .bypass  = pkt.bypass,
+                        .freq    = pkt.freq,
+                        .q       = pkt.Q,
+                        .gain_db = pkt.gain_db,
+                    };
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, eq)
+                                   + (pkt.channel * WIRE_MAX_BANDS + pkt.band)
+                                       * sizeof(WireBandParams)),
+                        sizeof(WireBandParams), &wp);
                 }
                 break;
             }
@@ -657,6 +671,16 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     xp->phase_invert = pkt.phase_invert;
                     xp->gain_db      = pkt.gain_db;
                     xp->gain_linear  = db_to_linear(pkt.gain_db);
+                    WireCrosspoint wxp = {
+                        .enabled      = pkt.enabled,
+                        .phase_invert = pkt.phase_invert,
+                        .gain_db      = pkt.gain_db,
+                    };
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, crosspoints)
+                                   + (pkt.input * WIRE_MAX_OUTPUT_CHANNELS + pkt.output)
+                                       * sizeof(WireCrosspoint)),
+                        sizeof(WireCrosspoint), &wxp);
                 }
                 break;
             }
@@ -664,7 +688,13 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
             case REQ_SET_OUTPUT_ENABLE: {
                 uint8_t out = vendor_last_wValue & 0xFF;
                 if (out < NUM_OUTPUT_CHANNELS && vendor_last_wLength >= 1) {
-                    matrix_mixer.outputs[out].enabled = (vendor_rx_buf[0] != 0);
+                    uint8_t v = (vendor_rx_buf[0] != 0) ? 1 : 0;
+                    matrix_mixer.outputs[out].enabled = v;
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, outputs)
+                                   + out * sizeof(WireOutputChannel)
+                                   + offsetof(WireOutputChannel, enabled)),
+                        1, &v);
                 }
                 break;
             }
@@ -676,6 +706,11 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     memcpy(&db, vendor_rx_buf, 4);
                     matrix_mixer.outputs[out].gain_db     = db;
                     matrix_mixer.outputs[out].gain_linear = db_to_linear(db);
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, outputs)
+                                   + out * sizeof(WireOutputChannel)
+                                   + offsetof(WireOutputChannel, gain_db)),
+                        sizeof(float), &db);
                 }
                 break;
             }
@@ -683,7 +718,13 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
             case REQ_SET_OUTPUT_MUTE: {
                 uint8_t out = vendor_last_wValue & 0xFF;
                 if (out < NUM_OUTPUT_CHANNELS && vendor_last_wLength >= 1) {
-                    matrix_mixer.outputs[out].mute = vendor_rx_buf[0];
+                    uint8_t v = vendor_rx_buf[0] ? 1 : 0;
+                    matrix_mixer.outputs[out].mute = v;
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, outputs)
+                                   + out * sizeof(WireOutputChannel)
+                                   + offsetof(WireOutputChannel, mute)),
+                        1, &v);
                 }
                 break;
             }
@@ -721,14 +762,23 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 float db; memcpy(&db, vendor_rx_buf, 4);
                 for (uint8_t ch = 0; ch < NUM_INPUT_CHANNELS; ++ch) {
                     update_preamp_ch(ch, db);
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, preamp.preamp_db)
+                                   + ch * sizeof(float)),
+                        sizeof(float), &db);
                 }
                 break;
             }
             case REQ_SET_PREAMP_CH: {
                 if (vendor_last_wLength < 4) break;
                 uint8_t ch = vendor_last_wValue & 0xFF;
+                if (ch >= NUM_INPUT_CHANNELS) break;
                 float db; memcpy(&db, vendor_rx_buf, 4);
                 update_preamp_ch(ch, db);
+                notify_param_write(
+                    (uint16_t)(offsetof(WireBulkParams, preamp.preamp_db)
+                               + ch * sizeof(float)),
+                    sizeof(float), &db);
                 break;
             }
 
@@ -774,13 +824,22 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     channel_gain_db    [ch] = db;
                     channel_gain_linear[ch] = lin;
                     channel_gain_mul   [ch] = (int32_t)(lin * 32768.0f);
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, legacy.gain_db)
+                                   + ch * sizeof(float)),
+                        sizeof(float), &db);
                 }
                 break;
             }
             case REQ_SET_CHANNEL_MUTE: {
                 uint8_t ch = vendor_last_wValue & 0xFF;
-                if (ch < 3 && vendor_last_wLength >= 1)
-                    channel_mute[ch] = (vendor_rx_buf[0] != 0);
+                if (ch < 3 && vendor_last_wLength >= 1) {
+                    uint8_t v = (vendor_rx_buf[0] != 0) ? 1 : 0;
+                    channel_mute[ch] = v;
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, legacy.mute) + ch),
+                        1, &v);
+                }
                 break;
             }
 
@@ -819,6 +878,9 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 if (vendor_last_wLength >= 1) {
                     crossfeed_config.enabled = (vendor_rx_buf[0] != 0);
                     crossfeed_update_pending = true;
+                    uint8_t v = crossfeed_config.enabled ? 1 : 0;
+                    notify_param_write(offsetof(WireBulkParams, crossfeed.enabled),
+                                       1, &v);
                 }
                 break;
             case REQ_SET_CROSSFEED_PRESET:
@@ -827,6 +889,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     if (p <= CROSSFEED_PRESET_CUSTOM) {
                         crossfeed_config.preset = p;
                         crossfeed_update_pending = true;
+                        notify_param_write(offsetof(WireBulkParams, crossfeed.preset),
+                                           1, &p);
                     }
                 }
                 break;
@@ -838,6 +902,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     crossfeed_config.custom_fc = v;
                     if (crossfeed_config.preset == CROSSFEED_PRESET_CUSTOM)
                         crossfeed_update_pending = true;
+                    notify_param_write(offsetof(WireBulkParams, crossfeed.custom_fc),
+                                       sizeof(float), &v);
                 }
                 break;
             case REQ_SET_CROSSFEED_FEED:
@@ -848,12 +914,17 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     crossfeed_config.custom_feed_db = v;
                     if (crossfeed_config.preset == CROSSFEED_PRESET_CUSTOM)
                         crossfeed_update_pending = true;
+                    notify_param_write(offsetof(WireBulkParams, crossfeed.custom_feed_db),
+                                       sizeof(float), &v);
                 }
                 break;
             case REQ_SET_CROSSFEED_ITD:
                 if (vendor_last_wLength >= 1) {
                     crossfeed_config.itd_enabled = (vendor_rx_buf[0] != 0);
                     crossfeed_update_pending = true;
+                    uint8_t v = crossfeed_config.itd_enabled ? 1 : 0;
+                    notify_param_write(offsetof(WireBulkParams, crossfeed.itd_enabled),
+                                       1, &v);
                 }
                 break;
 
@@ -862,6 +933,9 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     leveller_config.enabled = (vendor_rx_buf[0] != 0);
                     leveller_update_pending = true;
                     leveller_reset_pending  = true;
+                    uint8_t v = leveller_config.enabled ? 1 : 0;
+                    notify_param_write(offsetof(WireBulkParams, leveller.enabled),
+                                       1, &v);
                 }
                 break;
             case REQ_SET_LEVELLER_AMOUNT:
@@ -871,6 +945,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     if (v > LEVELLER_AMOUNT_MAX) v = LEVELLER_AMOUNT_MAX;
                     leveller_config.amount = v;
                     leveller_update_pending = true;
+                    notify_param_write(offsetof(WireBulkParams, leveller.amount),
+                                       sizeof(float), &v);
                 }
                 break;
             case REQ_SET_LEVELLER_SPEED:
@@ -879,6 +955,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     if (s < LEVELLER_SPEED_COUNT) {
                         leveller_config.speed = s;
                         leveller_update_pending = true;
+                        notify_param_write(offsetof(WireBulkParams, leveller.speed),
+                                           1, &s);
                     }
                 }
                 break;
@@ -889,6 +967,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     if (v > LEVELLER_MAX_GAIN_MAX) v = LEVELLER_MAX_GAIN_MAX;
                     leveller_config.max_gain_db = v;
                     leveller_update_pending = true;
+                    notify_param_write(offsetof(WireBulkParams, leveller.max_gain_db),
+                                       sizeof(float), &v);
                 }
                 break;
             case REQ_SET_LEVELLER_LOOKAHEAD:
@@ -896,6 +976,9 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     leveller_config.lookahead = (vendor_rx_buf[0] != 0);
                     leveller_update_pending = true;
                     leveller_reset_pending  = true;
+                    uint8_t v = leveller_config.lookahead ? 1 : 0;
+                    notify_param_write(offsetof(WireBulkParams, leveller.lookahead),
+                                       1, &v);
                 }
                 break;
             case REQ_SET_LEVELLER_GATE:
@@ -905,6 +988,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     if (v > LEVELLER_GATE_MAX) v = LEVELLER_GATE_MAX;
                     leveller_config.gate_threshold_db = v;
                     leveller_update_pending = true;
+                    notify_param_write(offsetof(WireBulkParams, leveller.gate_threshold_db),
+                                       sizeof(float), &v);
                 }
                 break;
 
@@ -915,6 +1000,12 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     size_t copy_len = vendor_last_wLength < (PRESET_NAME_LEN - 1)
                                     ? vendor_last_wLength : (PRESET_NAME_LEN - 1);
                     memcpy(channel_names[ch], vendor_rx_buf, copy_len);
+                    /* Push the FULL 32-byte name slot — easier than carving
+                     * a partial diff for variable-length string updates. */
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, channel_names)
+                                   + ch * WIRE_NAME_LEN),
+                        WIRE_NAME_LEN, channel_names[ch]);
                 }
                 break;
             }
@@ -923,6 +1014,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 uint8_t new_type = (vendor_last_wValue >> 8) & 0xFF;
                 if (slot < NUM_SPDIF_INSTANCES && new_type <= 1) {
                     output_types[slot] = new_type;
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, i2s_config.output_types)
+                                   + slot),
+                        1, &new_type);
                 }
                 break;
             }
