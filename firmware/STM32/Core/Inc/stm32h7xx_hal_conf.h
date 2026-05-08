@@ -17,6 +17,7 @@ extern "C" {
 /* ------------- Module Selection (M0 minimum) ------------- */
 #define HAL_MODULE_ENABLED
 #define HAL_ADC_MODULE_ENABLED          /* M7g: internal temp sensor on ADC3_IN18 */
+#define HAL_SPI_MODULE_ENABLED          /* M11: SPI3 -> W25Q64 preset flash */
 #define HAL_CORTEX_MODULE_ENABLED
 #define HAL_DMA_MODULE_ENABLED
 #define HAL_FLASH_MODULE_ENABLED
@@ -102,6 +103,9 @@ extern "C" {
 #endif
 #ifdef HAL_ADC_MODULE_ENABLED
   #include "stm32h7xx_hal_adc.h"
+#endif
+#ifdef HAL_SPI_MODULE_ENABLED
+  #include "stm32h7xx_hal_spi.h"
 #endif
 
 #ifdef USE_FULL_ASSERT

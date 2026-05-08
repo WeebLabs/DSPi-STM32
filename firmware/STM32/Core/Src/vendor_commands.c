@@ -316,6 +316,36 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 4);
                 }
+                case 0xFD: {  /* DEBUG (M11): W25Q64 JEDEC ID + presence flag */
+                    extern uint8_t w25q_jedec_id[3];
+                    extern bool    w25q_present;
+                    static uint8_t buf[4];
+                    buf[0] = w25q_jedec_id[0];
+                    buf[1] = w25q_jedec_id[1];
+                    buf[2] = w25q_jedec_id[2];
+                    buf[3] = w25q_present ? 1 : 0;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
+                case 0xFC: {  /* DEBUG (M11): W25Q sector RW round-trip test.
+                               * Erases sector at byte offset 0, programs an
+                               * 8-byte signature, reads back, returns the 8
+                               * bytes. A successful round-trip returns:
+                               *   D5 9P 1D 5C 0D ED B0 0B
+                               * Anything else = SPI link broken.            */
+                    #include "w25q.h"
+                    static const uint8_t sig[8] = {
+                        0xD5,0x9F,0x1D,0x5C,0x0D,0xED,0xB0,0x0B
+                    };
+                    static uint8_t out[8];
+                    w25q_sector_erase_4k(0);
+                    w25q_page_program(0, sig, sizeof(sig));
+                    w25q_read(0, out, sizeof(out));
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            out, sizeof(out));
+                }
                 case 0xFE: {  /* DEBUG: dump delay-stage internal state */
                     static struct __attribute__((packed)) {
                         int32_t  ds0;       /* channel_delay_samples[0]   */
