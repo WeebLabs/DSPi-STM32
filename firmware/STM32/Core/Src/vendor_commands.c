@@ -24,6 +24,8 @@
 
 #include "usb_audio.h"   /* update_master_volume, AudioState, channel_names */
 #include "audio_input.h" /* INPUT_SOURCE_USB */
+#include "notify.h"      /* notify_param_write — M7j */
+#include <stddef.h>      /* offsetof */
 
 extern uint8_t channel_band_counts[NUM_CHANNELS];
 extern MatrixMixer matrix_mixer;
@@ -630,11 +632,16 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 uint8_t ch   = (vendor_last_wValue >> 8) & 0xFF;
                 uint8_t band =  vendor_last_wValue       & 0xFF;
                 if (ch < NUM_CHANNELS && band < channel_band_counts[ch]) {
-                    filter_recipes[ch][band].bypass =
-                        (vendor_rx_buf[0] == 1) ? 1 : 0;
+                    uint8_t v = (vendor_rx_buf[0] == 1) ? 1 : 0;
+                    filter_recipes[ch][band].bypass = v;
                     dsp_compute_coefficients(&filter_recipes[ch][band],
                                              &filters[ch][band],
                                              (float)audio_state.freq);
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, eq)
+                                   + (ch * WIRE_MAX_BANDS + band) * sizeof(WireBandParams)
+                                   + offsetof(WireBandParams, bypass)),
+                        1, &v);
                 }
                 break;
             }
@@ -699,6 +706,11 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     matrix_mixer.outputs[out].delay_ms = ms;
                     channel_delays_ms[CH_OUT_1 + out]  = ms;
                     dsp_update_delay_samples((float)audio_state.freq);
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, outputs)
+                                   + out * sizeof(WireOutputChannel)
+                                   + offsetof(WireOutputChannel, delay_ms)),
+                        sizeof(float), &ms);
                 }
                 break;
             }
@@ -724,12 +736,17 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 if (vendor_last_wLength < 4) break;
                 float db; memcpy(&db, vendor_rx_buf, 4);
                 update_master_volume(db);
+                notify_param_write(offsetof(WireBulkParams, master_volume.master_volume_db),
+                                   sizeof(float), &db);
                 break;
             }
 
             case REQ_SET_BYPASS:
-                if (vendor_last_wLength >= 1)
+                if (vendor_last_wLength >= 1) {
                     bypass_master_eq = (vendor_rx_buf[0] != 0);
+                    uint8_t v = bypass_master_eq ? 1 : 0;
+                    notify_param_write(offsetof(WireBulkParams, global.bypass), 1, &v);
+                }
                 break;
 
             case REQ_SET_DELAY: {
@@ -741,6 +758,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     /* Recompute delay-sample counts + any_delay_active bypass
                      * flag for fill_half's Stage 6.5 delay-line stage. */
                     dsp_update_delay_samples((float)audio_state.freq);
+                    notify_param_write(
+                        (uint16_t)(offsetof(WireBulkParams, delays.delay_ms)
+                                   + ch * sizeof(float)),
+                        sizeof(float), &ms);
                 }
                 break;
             }
@@ -764,8 +785,12 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
             }
 
             case REQ_SET_LOUDNESS:
-                if (vendor_last_wLength >= 1)
+                if (vendor_last_wLength >= 1) {
                     loudness_enabled = (vendor_rx_buf[0] != 0);
+                    uint8_t v = loudness_enabled ? 1 : 0;
+                    notify_param_write(offsetof(WireBulkParams, global.loudness_enabled),
+                                       1, &v);
+                }
                 break;
             case REQ_SET_LOUDNESS_REF:
                 if (vendor_last_wLength >= 4) {
@@ -774,6 +799,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     if (v > 100.0f) v = 100.0f;
                     loudness_ref_spl = v;
                     loudness_recompute_pending = true;
+                    notify_param_write(offsetof(WireBulkParams, global.loudness_ref_spl),
+                                       sizeof(float), &v);
                 }
                 break;
             case REQ_SET_LOUDNESS_INTENSITY:
@@ -783,6 +810,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     if (v > 200.0f) v = 200.0f;
                     loudness_intensity_pct = v;
                     loudness_recompute_pending = true;
+                    notify_param_write(offsetof(WireBulkParams, global.loudness_intensity_pct),
+                                       sizeof(float), &v);
                 }
                 break;
 

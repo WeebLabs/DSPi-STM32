@@ -21,6 +21,7 @@
 #include "usb_audio.h"
 #include "usb_descriptors.h"
 #include "loudness.h"   /* current_loudness_coeffs / loudness_active_table */
+#include "notify.h"     /* M7j: bulk IN 0x83 device->host param notifications */
 
 /* ---------------- Endpoint buffers ----------------
  * AUDIO_EP_MAX_PKT covers nominal + jitter at the highest format we'll
@@ -115,6 +116,11 @@ static struct {
     uint8_t pending_len;
 } uac1 = { .cur_alt = 0 };
 
+/* M7j: forward decl — usb_notify_drain is defined alongside the xfer_cb
+ * below but uac1_open() (above) needs to kick the first transfer when the
+ * notify EP opens, so we forward-declare here. */
+static void usb_notify_drain(uint8_t rhport);
+
 static uint8_t  uac1_ctrl_buf[8];
 
 /* ====================================================================== */
@@ -126,6 +132,7 @@ static void uac1_init(void)   {
     audio_streaming = false;
     audio_bytes_received = 0;
     audio_packets_received = 0;
+    notify_init();   /* M7j: seed shadow buffer + ring */
 }
 
 static bool uac1_deinit(void) { return true; }
@@ -135,7 +142,9 @@ static void uac1_reset(uint8_t rhport) {
     uac1.cur_alt = 0;
     uac1.ep_data_open = false;
     uac1.ep_fb_open = false;
+    uac1.notify_ep_open = false;
     audio_streaming = false;
+    notify_reset_queue();   /* M7j: drop pending events on USB reset */
 }
 
 /* TinyUSB walks the configuration descriptor at SetConfiguration time and
@@ -165,6 +174,10 @@ static uint16_t uac1_open(uint8_t rhport,
                     (tusb_desc_endpoint_t const *)p_ep;
                 if (usbd_edpt_open(rhport, ep_desc)) {
                     uac1.notify_ep_open = true;
+                    /* Kick the always-armed pattern off — first xfer puts
+                     * an idle keep-alive on the wire so the pipe state
+                     * stays "hot". xfer_cb then re-arms each completion. */
+                    usb_notify_drain(rhport);
                 }
                 drv_len += p_ep[0];
             }
@@ -502,11 +515,51 @@ static bool uac1_control_xfer_cb(uint8_t rhport, uint8_t stage,
     return true;
 }
 
+/* ---------------- M7j: bulk IN 0x83 notify-EP drain ----------------
+ *
+ * Pattern is "always-armed" — keep a transfer in flight on EP 0x83 even
+ * when the event ring is empty (1-byte 0x00 idle keep-alive). This
+ * matches RP firmware exactly. Without it macOS IOKit drops the first
+ * packet after a long idle gap on the bulk pipe (pipe state goes "cold"),
+ * which Console reads as missed updates. Console-side filter discards
+ * 1-byte idles so the user-visible stream is unaffected.
+ */
+static uint8_t notify_buf[NOTIFY_EP_MAX_PKT];
+
+static void usb_notify_drain(uint8_t rhport) {
+    if (!uac1.notify_ep_open) return;
+    if (usbd_edpt_busy(rhport, NOTIFY_IN_ENDPOINT)) return;
+
+    uint16_t len = 0;
+    bool consumed = false;
+    if (notify_has_pending()) {
+        len = notify_peek_next(notify_buf, NOTIFY_EP_MAX_PKT);
+        consumed = (len > 0);
+    }
+    if (len == 0) {
+        notify_buf[0] = 0x00;   /* idle keep-alive */
+        len = 1;
+        consumed = false;
+    }
+
+    if (!usbd_edpt_xfer(rhport, NOTIFY_IN_ENDPOINT, notify_buf, len)) {
+        return;     /* DCD rejected — leave tail; xfer_cb retries */
+    }
+    if (consumed) notify_commit_pop();
+}
+
 /* ---------------- Endpoint transfer completions ---------------- */
 
 static bool uac1_xfer_cb(uint8_t rhport, uint8_t ep_addr,
                          xfer_result_t result, uint32_t xferred_bytes) {
     (void)rhport; (void)result;
+
+    if (ep_addr == NOTIFY_IN_ENDPOINT) {
+        /* One notify packet (or idle keep-alive) just delivered — re-arm
+         * with the next pending event, or another idle. */
+        if (uac1.notify_ep_open) usb_notify_drain(rhport);
+        return true;
+    }
 
     if (ep_addr == AUDIO_OUT_ENDPOINT) {
         audio_bytes_received   += xferred_bytes;

@@ -26,6 +26,7 @@
 #include "dsp_pipeline.h"
 #include "bulk_params.h"
 #include "loudness.h"
+#include "notify.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -153,6 +154,15 @@ int main(void) {
             leveller_update_pending    = true;
             leveller_reset_pending     = true;
             loudness_recompute_pending = true;
+
+            /* M7j: bulk SET wholesale-replaces device state. Re-baseline the
+             * notify shadow so the next per-field SET diffs against the
+             * post-bulk values (otherwise every field that changed in the
+             * bulk would emit a stale PARAM_CHANGED on its first re-edit),
+             * and push a BULK_INVALIDATED so other Console instances
+             * re-fetch the full state via REQ_GET_ALL_PARAMS. */
+            notify_rebaseline();
+            notify_push_bulk_invalidated(PARAM_SRC_BULK_SET);
         }
 
         /* Loudness compensation: recompute the 61×2 coefficient table when
