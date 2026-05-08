@@ -34,6 +34,7 @@
 #include "dsp_pipeline.h"  /* M7c: per-channel biquad EQ */
 #include "crossfeed.h"     /* M7d: BS2B crossfeed */
 #include "leveller.h"      /* M7d: volume leveller */
+#include <math.h>          /* M7e: fabsf for level meters */
 
 /* ---- Single shared DMA ring in AXI SRAM (DMA1 cannot reach DTCM) ---- */
 #define AUDIO_BUFFER_BASE  0x24000000UL
@@ -102,6 +103,11 @@ extern float    delay_lines[NUM_DELAY_CHANNELS][MAX_DELAY_SAMPLES];
 extern uint32_t delay_write_idx;
 extern int32_t  channel_delay_samples[NUM_DELAY_CHANNELS];
 extern bool     any_delay_active;
+
+/* M7e: level meters. global_status.peaks[] is u16 [0..32767] = |sample|*32767.
+ * Console polls REQ_GET_STATUS wValue=9 every ~30 ms; we just keep refreshing
+ * the latest per-fill-half block peak in place — Console smooths visually. */
+extern volatile SystemStatusPacket global_status;
 
 /* Local DSP state (zeroed on init by Audio_Init). */
 static CrossfeedState crossfeed_state;
@@ -260,15 +266,48 @@ static void fill_half(int32_t *dst) {
     }
 
     /* === Stage 7: per-output gain + master volume + clamp + 24-bit
-     *               quantisation into the SAI ping-pong slot. */
+     *               quantisation into the SAI ping-pong slot.  Peaks
+     *               folded into the same loop so we don't re-traverse. */
+    float pk_in_l = 0.0f, pk_in_r = 0.0f;
+    float pk_o0   = 0.0f, pk_o1   = 0.0f;
+    bool  clip0   = false, clip1  = false;
+
     for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
+        /* Pre-gain "master/input" peaks (track buf_l/buf_r, post-EQ but
+         * before output-routing — closest analogue to the RP master peak
+         * so Console's "USB L/R" meter behaves the same). */
+        float al = fabsf(buf_l[k]); if (al > pk_in_l) pk_in_l = al;
+        float ar = fabsf(buf_r[k]); if (ar > pk_in_r) pk_in_r = ar;
+
         float o0 = buf_o0[k] * out0_post_gain * master;
         float o1 = buf_o1[k] * out1_post_gain * master;
+
+        /* Clip detection BEFORE clamp (RP convention — flag if any sample
+         * tried to exceed full-scale before the limiter hides it). */
+        float ao0 = fabsf(o0); if (ao0 > pk_o0) pk_o0 = ao0;
+        float ao1 = fabsf(o1); if (ao1 > pk_o1) pk_o1 = ao1;
+        if (ao0 > CLIP_THRESH_F) clip0 = true;
+        if (ao1 > CLIP_THRESH_F) clip1 = true;
+
         if (o0 >  1.0f) o0 =  1.0f; else if (o0 < -1.0f) o0 = -1.0f;
         if (o1 >  1.0f) o1 =  1.0f; else if (o1 < -1.0f) o1 = -1.0f;
         dst[2*k + 0] = (int32_t)(o0 * FLOAT_TO_24);
         dst[2*k + 1] = (int32_t)(o1 * FLOAT_TO_24);
     }
+
+    /* Publish to global_status — converted u16 [0..32767]. clip_flags is a
+     * sticky bitmask cleared by REQ_CLEAR_CLIPS so brief overshoots stay
+     * visible until the user explicitly resets. */
+    if (pk_in_l > 1.0f) pk_in_l = 1.0f;
+    if (pk_in_r > 1.0f) pk_in_r = 1.0f;
+    if (pk_o0   > 1.0f) pk_o0   = 1.0f;
+    if (pk_o1   > 1.0f) pk_o1   = 1.0f;
+    global_status.peaks[CH_MASTER_LEFT]  = (uint16_t)(pk_in_l * 32767.0f);
+    global_status.peaks[CH_MASTER_RIGHT] = (uint16_t)(pk_in_r * 32767.0f);
+    global_status.peaks[CH_OUT_1]        = (uint16_t)(pk_o0   * 32767.0f);
+    global_status.peaks[CH_OUT_2]        = (uint16_t)(pk_o1   * 32767.0f);
+    if (clip0) global_status.clip_flags |= (1u << CH_OUT_1);
+    if (clip1) global_status.clip_flags |= (1u << CH_OUT_2);
 }
 
 void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai) {
