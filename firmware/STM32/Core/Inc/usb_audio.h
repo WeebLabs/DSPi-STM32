@@ -42,4 +42,16 @@ extern volatile uint32_t audio_bytes_received;
 extern volatile uint32_t audio_packets_received;
 extern volatile bool     audio_streaming;
 
+/* USB→SAI ring (M6a). The UAC1 ISO OUT EP writes 16-bit stereo PCM
+ * frames here; audio_out.c reads them out into the SAI ping-pong
+ * buffer. One "frame" = one stereo pair = two int16 samples = 4 bytes.
+ *
+ * usb_ring_pop_frames returns how many full stereo frames it
+ * actually delivered (≤ requested). Caller fills any shortfall with
+ * silence. The ring is power-of-two sized so the modulo is a mask. */
+#define USB_RING_FRAMES   1024U     /* 21 ms at 48 kHz, ~4 KB */
+
+uint32_t usb_ring_pop_frames(int16_t *dst, uint32_t want_frames);
+uint32_t usb_ring_level_frames(void);   /* current fill, for diagnostics */
+
 #endif

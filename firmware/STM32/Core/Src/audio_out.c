@@ -1,45 +1,39 @@
 /**
- * audio_out.c — DSPi STM32H723, M4+M5 SAI1_A + SAI1_B I2S TX
+ * audio_out.c — DSPi STM32H723, M4 + M5 + M6a SAI1_A + SAI1_B I2S TX
  *
  * Brings up SAI1 sub-blocks A and B as I2S Philips master TX.
  *
  *   Sub-block A: asynchronous master, generates BCK/FS/MCLK on
  *                PE2 (MCLK)/PE4 (FS)/PE5 (BCK)/PE6 (SD). DMA1 Stream 0.
- *                Plays a 1 kHz sine.
  *
  *   Sub-block B: SYNCHRONOUS to A — uses A's BCK and FS clocks via the
  *                internal sister-block sync path; outputs serial data on
  *                PE3 (the only LQFP100 pin available for SAI1_SD_B).
- *                DMA1 Stream 1. Plays a 500 Hz sine so the user can
- *                audibly distinguish the two outputs by patching their
- *                I2S DAC across PE6 vs PE3 — or scope-verify both pins
- *                share the BCK/FS edges with the data starting on the
- *                same word boundary.
+ *                DMA1 Stream 1. Both DMAs read from the SAME ping-pong
+ *                buffer in AXI SRAM, so PE3 mirrors PE6 sample-for-sample.
  *
- * Sample alignment is the M5 hard-constraint payload. The DSPi project
- * requires every output slot to share the same first sample across all
- * outputs at all times. With B as a synchronous slave, both blocks emit
- * their first data bit on the same BCK edge — proven correct by H7
- * SAI hardware, not software-arranged.
+ * Sample alignment (M5 hard constraint): both blocks emit their first
+ * data bit on the same BCK edge because B is a clock-slave to A; both
+ * DMAs read the same memory at the same rate; the sample on PE3 is
+ * literally the same int32_t word as the sample on PE6.
  *
- * DMA buffer placement: both buffers live at fixed AXI SRAM addresses
- * (0x24000000 for A, 0x24001000 for B) because DMA1 cannot reach DTCM
- * and stm32-cmake's auto-generated linker script only declares the
- * DTCM region. D-cache is off through M5, so no MPU surgery yet —
- * proper LD + non-cacheable region lands in M5b along with full DSP
- * pipeline integration.
+ * Audio source (M6a): the USB UAC1 OUT EP feeds a small ring buffer in
+ * usb_audio.c; this file's fill_half drains the ring, converts each
+ * 16-bit signed PCM sample to the SAI's 24-bit-right-aligned format
+ * (sample << 8 to scale 16→24, NOT to MSB-align in the slot — see
+ * lesson 10), and writes it into the half-buffer. If the ring is
+ * starving (USB idle, between packets, or alt-0), the slot fills with
+ * silence so the SAI keeps clocking and the DAC stays locked.
  *
- * The sine tables loop once per integer number of samples per cycle:
- *   A: 48 samples × 1 cycle = 1.000 kHz exact at Fs = 48 kHz
- *   B: 96 samples × 1 cycle = 0.500 kHz exact at Fs = 48 kHz
+ * D-cache is still off through M6a; AXI SRAM access is coherent without
+ * MPU surgery. Custom linker script + cache enable arrives in M6c.
  */
 
 #include "main.h"
-#include <math.h>
+#include "usb_audio.h"
 
-/* ---- DMA ring buffers in AXI SRAM (DMA1 cannot reach DTCM) ---- */
-#define AUDIO_BUFFER_BASE_A  0x24000000UL
-#define AUDIO_BUFFER_BASE_B  0x24001000UL   /* 4 KB after A */
+/* ---- Single shared DMA ring in AXI SRAM (DMA1 cannot reach DTCM) ---- */
+#define AUDIO_BUFFER_BASE  0x24000000UL
 
 /* 192 stereo frames per ping-pong half × 2 halves × 2 ch = 768 int32 words.
  * 192 frames @ 48 kHz = 4 ms per half — comfortably above any HAL ISR
@@ -48,16 +42,11 @@
 #define AUDIO_FRAMES_TOTAL   (AUDIO_FRAMES_HALF * 2)
 #define AUDIO_WORDS_TOTAL    (AUDIO_FRAMES_TOTAL * 2)  /* L+R */
 
-static int32_t * const audio_buf_a = (int32_t *)AUDIO_BUFFER_BASE_A;
-static int32_t * const audio_buf_b = (int32_t *)AUDIO_BUFFER_BASE_B;
+static int32_t * const audio_buf = (int32_t *)AUDIO_BUFFER_BASE;
 
-/* ---- Sine LUTs ---- */
-#define SINE_A_LEN  48U   /* 1 kHz @ 48 kHz Fs */
-#define SINE_B_LEN  96U   /*  500 Hz @ 48 kHz Fs */
-static int32_t sine_a_table[SINE_A_LEN];
-static int32_t sine_b_table[SINE_B_LEN];
-static volatile uint32_t sine_a_phase = 0;
-static volatile uint32_t sine_b_phase = 0;
+/* Scratch for one half's worth of stereo 16-bit samples popped from the
+ * ring; converted to 24-bit-right-aligned in place into audio_buf[]. */
+static int16_t pop_scratch[AUDIO_FRAMES_HALF * 2];
 
 SAI_HandleTypeDef hsai_BlockA1;
 SAI_HandleTypeDef hsai_BlockB1;
@@ -65,60 +54,52 @@ DMA_HandleTypeDef hdma_sai1_a;
 DMA_HandleTypeDef hdma_sai1_b;
 
 volatile uint32_t audio_dma_callbacks = 0;
+volatile uint32_t audio_underruns     = 0;
 
 /* ---------------------------------------------------------------------- */
-/* Sine table generation — call once at init                              */
+/* DMA half-buffer fill — drain USB ring, convert 16-bit → 24-bit         */
 /* ---------------------------------------------------------------------- */
-static void sine_tables_init(void) {
-    for (uint32_t i = 0; i < SINE_A_LEN; ++i) {
-        float ang = (2.0f * 3.14159265358979323846f * (float)i) / (float)SINE_A_LEN;
-        float v   = sinf(ang) * 0.25f;          /* −12 dBFS */
-        int32_t s = (int32_t)(v * 8388607.0f);  /* 24-bit signed */
-        sine_a_table[i] = s;                    /* right-aligned in int32_t */
-    }
-    for (uint32_t i = 0; i < SINE_B_LEN; ++i) {
-        float ang = (2.0f * 3.14159265358979323846f * (float)i) / (float)SINE_B_LEN;
-        float v   = sinf(ang) * 0.25f;
-        int32_t s = (int32_t)(v * 8388607.0f);
-        sine_b_table[i] = s;
-    }
-}
+static void fill_half(int32_t *dst) {
+    /* Pop up to one half's worth of stereo frames. The ring may be
+     * starving, in which case we fill the rest with silence (0). */
+    uint32_t got = usb_ring_pop_frames(pop_scratch, AUDIO_FRAMES_HALF);
+    if (got < AUDIO_FRAMES_HALF) ++audio_underruns;
 
-/* ---------------------------------------------------------------------- */
-/* DMA half-buffer fillers                                                */
-/* ---------------------------------------------------------------------- */
-static void fill_half_a(int32_t *dst) {
-    for (uint32_t i = 0; i < AUDIO_FRAMES_HALF; ++i) {
-        int32_t s = sine_a_table[sine_a_phase];
-        dst[i * 2 + 0] = s;
-        dst[i * 2 + 1] = s;
-        if (++sine_a_phase >= SINE_A_LEN) sine_a_phase = 0;
+    /* Convert int16 → int32 with 8-bit headroom shift so the host's
+     * 16-bit samples become 24-bit-equivalent values right-aligned in
+     * the int32 word. The SAI peripheral reads bits [23:0] for 24-bit
+     * datasize (RM0468 §34.4); putting the source value into bits [23:8]
+     * preserves audio level (16-bit −0 dBFS → 24-bit −0 dBFS) while
+     * keeping the data in the LSB-aligned half of the int32 the SAI
+     * expects. */
+    uint32_t i;
+    for (i = 0; i < got; ++i) {
+        int32_t L = (int32_t)pop_scratch[2*i + 0] << 8;
+        int32_t R = (int32_t)pop_scratch[2*i + 1] << 8;
+        dst[2*i + 0] = L;
+        dst[2*i + 1] = R;
     }
-}
-
-static void fill_half_b(int32_t *dst) {
-    for (uint32_t i = 0; i < AUDIO_FRAMES_HALF; ++i) {
-        int32_t s = sine_b_table[sine_b_phase];
-        dst[i * 2 + 0] = s;
-        dst[i * 2 + 1] = s;
-        if (++sine_b_phase >= SINE_B_LEN) sine_b_phase = 0;
+    /* Pad shortfall with silence. */
+    for (; i < AUDIO_FRAMES_HALF; ++i) {
+        dst[2*i + 0] = 0;
+        dst[2*i + 1] = 0;
     }
 }
 
 void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai) {
+    /* Only A drives the fill — B reads the same buffer from its own DMA.
+     * A and B's half-cplt callbacks fire essentially simultaneously
+     * (they share the BCK/FS clocks); a stray B-side callback would
+     * just refill the same data redundantly, so we ignore it. */
     if (hsai == &hsai_BlockA1) {
-        fill_half_a(&audio_buf_a[0]);
-    } else if (hsai == &hsai_BlockB1) {
-        fill_half_b(&audio_buf_b[0]);
+        fill_half(&audio_buf[0]);
     }
     ++audio_dma_callbacks;
 }
 
 void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai) {
     if (hsai == &hsai_BlockA1) {
-        fill_half_a(&audio_buf_a[AUDIO_FRAMES_HALF * 2]);
-    } else if (hsai == &hsai_BlockB1) {
-        fill_half_b(&audio_buf_b[AUDIO_FRAMES_HALF * 2]);
+        fill_half(&audio_buf[AUDIO_FRAMES_HALF * 2]);
     }
     ++audio_dma_callbacks;
 }
@@ -251,27 +232,31 @@ void Audio_Init(void) {
      * still points at A's stream and B's buffer never flows. */
     __HAL_LINKDMA(&hsai_BlockB1, hdmatx, hdma_sai1_b);
 
-    /* Pre-fill both buffers with sine before kicking off DMA so the
-     * very first BCK edge has valid samples to ship on both pins. */
-    sine_tables_init();
-    fill_half_a(&audio_buf_a[0]);
-    fill_half_a(&audio_buf_a[AUDIO_FRAMES_HALF * 2]);
-    fill_half_b(&audio_buf_b[0]);
-    fill_half_b(&audio_buf_b[AUDIO_FRAMES_HALF * 2]);
+    /* Pre-fill the shared buffer with silence so the first BCK edges
+     * after Audio_Start ship zero samples until USB starts delivering. */
+    for (uint32_t i = 0; i < AUDIO_WORDS_TOTAL; ++i) {
+        audio_buf[i] = 0;
+    }
 }
 
 void Audio_Start(void) {
-    /* Start the synchronous slave (B) FIRST so its DMA + SAIEN are armed
-     * and waiting on A's BCK/FS edges. Then start A — the moment A's
-     * SAIEN bit goes high, BCK/FS begin toggling and B's first sample
-     * shifts out on the same edge as A's, giving sample-aligned output. */
+    /* Both A and B stream from the SAME ring (audio_buf). Two DMA
+     * streams reading from the same AXI SRAM range is fine — the AXI
+     * arbiter handles concurrent reads, and we only WRITE during the
+     * half-cplt callback (when DMA is reading the OTHER half).
+     *
+     * Start the synchronous slave (B) FIRST so its DMA + SAIEN are
+     * armed and waiting on A's BCK/FS edges. Then start A — the moment
+     * A's SAIEN goes high, BCK/FS begin toggling and B shifts out its
+     * first sample on the same edge as A's, giving sample-aligned
+     * output. */
     if (HAL_SAI_Transmit_DMA(&hsai_BlockB1,
-                             (uint8_t *)audio_buf_b,
+                             (uint8_t *)audio_buf,
                              AUDIO_WORDS_TOTAL) != HAL_OK) {
         Error_Handler();
     }
     if (HAL_SAI_Transmit_DMA(&hsai_BlockA1,
-                             (uint8_t *)audio_buf_a,
+                             (uint8_t *)audio_buf,
                              AUDIO_WORDS_TOTAL) != HAL_OK) {
         Error_Handler();
     }

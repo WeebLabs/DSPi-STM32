@@ -41,6 +41,68 @@ volatile uint32_t audio_bytes_received   = 0;
 volatile uint32_t audio_packets_received = 0;
 volatile bool     audio_streaming        = false;
 
+/* ---------------- USB → SAI ring buffer ----------------
+ * Single-producer (USB ISR via xfer_cb) / single-consumer (SAI half-cplt
+ * IRQ via fill_half) so head/tail can be plain volatiles without locks.
+ * Power-of-two size lets us mask instead of modulo.
+ *
+ * Size = 1024 stereo frames × 4 bytes = 4096 bytes. At 48 kHz that's
+ * a 21 ms reservoir — more than enough headroom for the SAI's 4 ms
+ * ping-pong half plus USB packet jitter, while keeping latency low. */
+#define USB_RING_FRAMES_MASK   (USB_RING_FRAMES - 1U)
+_Static_assert((USB_RING_FRAMES & USB_RING_FRAMES_MASK) == 0,
+               "USB_RING_FRAMES must be power of 2");
+
+/* Each entry is one stereo pair of int16_t — packed into a single uint32. */
+static uint32_t usb_ring[USB_RING_FRAMES];
+static volatile uint32_t usb_ring_head;   /* producer (USB) writes here */
+static volatile uint32_t usb_ring_tail;   /* consumer (SAI) reads here  */
+
+static inline uint32_t usb_ring_used(void) {
+    return (usb_ring_head - usb_ring_tail) & USB_RING_FRAMES_MASK;
+}
+static inline uint32_t usb_ring_free(void) {
+    /* Reserve one slot to distinguish full from empty. */
+    return USB_RING_FRAMES - 1U - usb_ring_used();
+}
+
+uint32_t usb_ring_level_frames(void) { return usb_ring_used(); }
+
+uint32_t usb_ring_pop_frames(int16_t *dst, uint32_t want_frames) {
+    uint32_t avail = usb_ring_used();
+    uint32_t n     = (want_frames < avail) ? want_frames : avail;
+    uint32_t tail  = usb_ring_tail;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t pkt = usb_ring[tail];
+        dst[2*i + 0] = (int16_t)(pkt & 0xFFFF);          /* L */
+        dst[2*i + 1] = (int16_t)((pkt >> 16) & 0xFFFF);  /* R */
+        tail = (tail + 1) & USB_RING_FRAMES_MASK;
+    }
+    usb_ring_tail = tail;
+    return n;
+}
+
+/* Called from the ISO OUT xfer_cb. `bytes` should be a multiple of 4
+ * (one stereo 16-bit frame). On overrun we drop the new packet — better
+ * to glitch than to overwrite tail data that the consumer might be
+ * mid-read on. */
+static void usb_ring_push_packet(uint8_t const *src, uint32_t bytes) {
+    uint32_t frames_in = bytes >> 2;        /* 4 bytes per stereo frame */
+    if (frames_in == 0)              return;
+    if (frames_in > usb_ring_free()) return;  /* drop on overrun */
+
+    uint32_t head = usb_ring_head;
+    /* Re-read source as int16 pairs and pack into our uint32 ring slots. */
+    int16_t const *s = (int16_t const *)src;
+    for (uint32_t i = 0; i < frames_in; ++i) {
+        uint32_t pkt = ((uint32_t)(uint16_t)s[2*i + 0])
+                     | ((uint32_t)(uint16_t)s[2*i + 1] << 16);
+        usb_ring[head] = pkt;
+        head = (head + 1) & USB_RING_FRAMES_MASK;
+    }
+    usb_ring_head = head;
+}
+
 /* ---------------- Internal driver state ---------------- */
 static struct {
     uint8_t cur_alt;       /* current AS alt setting (0 = idle, 1 = 16-bit/48k) */
@@ -245,6 +307,10 @@ static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
         uac1.ep_data_open = false;
         uac1.ep_fb_open   = false;
         audio_streaming = false;
+        /* Drain the USB→SAI ring so a stale buffered second of audio
+         * doesn't replay when alt-1 reactivates. */
+        usb_ring_head = 0;
+        usb_ring_tail = 0;
         return true;
     }
 
@@ -362,9 +428,14 @@ static bool uac1_xfer_cb(uint8_t rhport, uint8_t ep_addr,
     (void)rhport; (void)result;
 
     if (ep_addr == AUDIO_OUT_ENDPOINT) {
-        /* M3: discard. Just count. */
         audio_bytes_received   += xferred_bytes;
         audio_packets_received += 1;
+        /* M6a: push the just-received audio frames into the USB→SAI ring
+         * so audio_out.c's fill_half can drain them on the next SAI
+         * half-cplt. Drops the packet on overrun (preferable to data
+         * corruption); diagnostics could surface this as a counter
+         * later. */
+        usb_ring_push_packet(audio_out_buf, xferred_bytes);
         /* Re-arm for the next 1 ms frame. */
         usbd_edpt_xfer(0, AUDIO_OUT_ENDPOINT, audio_out_buf, AUDIO_EP_MAX_PKT);
         return true;
