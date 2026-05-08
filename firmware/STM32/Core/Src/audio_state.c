@@ -112,6 +112,12 @@ uint16_t i2s_mck_multiplier = 128;
 /* -------- Audio state (top-level UI mirror) -------- */
 volatile AudioState audio_state = { .freq = 48000 };
 
+/* -------- System status packet (REQ_GET_STATUS combined response) --------
+ * Console polls this for peak meters, CPU load, clip flags. M7d ships
+ * zeros — real metering hooks in M8+ once we have the buffer-watermark
+ * + clip-detect plumbing. */
+volatile SystemStatusPacket global_status = { 0 };
+
 /* -------- Other globals the DSP files reach for -------- */
 volatile bool bypass_master_eq = false;
 

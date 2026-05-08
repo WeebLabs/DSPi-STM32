@@ -84,6 +84,8 @@ volatile uint32_t audio_underruns     = 0;
 #define FLOAT_TO_24   8388607.0f      /* 2^23 − 1 */
 
 extern MatrixMixer matrix_mixer;
+extern volatile float global_preamp_linear[NUM_INPUT_CHANNELS];
+extern volatile float master_volume_linear;
 
 /* Per-output EQ channel index: Out0 → channel 2, Out1 → channel 3. */
 #define EQ_CH_OUT0    2
@@ -115,10 +117,16 @@ static void fill_half(int32_t *dst) {
     float out0_post_gain = (out0->enabled && !out0->mute) ? out0->gain_linear : 0.0f;
     float out1_post_gain = (out1->enabled && !out1->mute) ? out1->gain_linear : 0.0f;
 
+    /* M7d: per-input preamp + master volume snapshots — once per
+     * buffer-half so the inner sample loop stays branch-light. */
+    float preamp_l = global_preamp_linear[0];
+    float preamp_r = global_preamp_linear[1];
+    float master   = master_volume_linear;
+
     uint32_t i;
     for (i = 0; i < got; ++i) {
-        float L = (float)pop_scratch[2*i + 0] * INT16_RECIP;
-        float R = (float)pop_scratch[2*i + 1] * INT16_RECIP;
+        float L = (float)pop_scratch[2*i + 0] * INT16_RECIP * preamp_l;
+        float R = (float)pop_scratch[2*i + 1] * INT16_RECIP * preamp_r;
 
         /* Per-input EQ */
         L = dsp_process_channel(filters[0], L, 0);
@@ -132,9 +140,9 @@ static void fill_half(int32_t *dst) {
         o0 = dsp_process_channel(filters[EQ_CH_OUT0], o0, EQ_CH_OUT0);
         o1 = dsp_process_channel(filters[EQ_CH_OUT1], o1, EQ_CH_OUT1);
 
-        /* Per-output gain + mute (mute folded into gain == 0) */
-        o0 *= out0_post_gain;
-        o1 *= out1_post_gain;
+        /* Per-output gain + mute, then master volume ceiling. */
+        o0 *= out0_post_gain * master;
+        o1 *= out1_post_gain * master;
 
         /* Soft-clamp at ±1.0 before quantising to 24-bit. */
         if (o0 >  1.0f) o0 =  1.0f; else if (o0 < -1.0f) o0 = -1.0f;
