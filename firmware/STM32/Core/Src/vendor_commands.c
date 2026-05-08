@@ -273,6 +273,54 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 1);
                 }
+
+                case REQ_GET_MATRIX_ROUTE: {
+                    uint8_t in_  = (req->wValue >> 8) & 0xFF;
+                    uint8_t out  =  req->wValue       & 0xFF;
+                    if (in_ >= NUM_INPUT_CHANNELS || out >= NUM_OUTPUT_CHANNELS)
+                        return false;
+                    static MatrixRoutePacket pkt;
+                    MatrixCrosspoint *xp = &matrix_mixer.crosspoints[in_][out];
+                    pkt.input = in_; pkt.output = out;
+                    pkt.enabled = xp->enabled;
+                    pkt.phase_invert = xp->phase_invert;
+                    pkt.gain_db = xp->gain_db;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &pkt, sizeof(pkt));
+                }
+                case REQ_GET_OUTPUT_ENABLE: {
+                    uint8_t out = (uint8_t)req->wValue;
+                    if (out >= NUM_OUTPUT_CHANNELS) return false;
+                    static uint8_t v;
+                    v = matrix_mixer.outputs[out].enabled;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_OUTPUT_GAIN: {
+                    uint8_t out = (uint8_t)req->wValue;
+                    if (out >= NUM_OUTPUT_CHANNELS) return false;
+                    static float v;
+                    v = matrix_mixer.outputs[out].gain_db;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
+                case REQ_GET_OUTPUT_MUTE: {
+                    uint8_t out = (uint8_t)req->wValue;
+                    if (out >= NUM_OUTPUT_CHANNELS) return false;
+                    static uint8_t v;
+                    v = matrix_mixer.outputs[out].mute;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_OUTPUT_DELAY: {
+                    uint8_t out = (uint8_t)req->wValue;
+                    if (out >= NUM_OUTPUT_CHANNELS) return false;
+                    static float v;
+                    v = matrix_mixer.outputs[out].delay_ms;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
                 case REQ_GET_EQ_PARAM: {
                     /* wValue encodes (channel<<8) | (band<<4) | param.
                      *   param: 0=type, 1=freq(f32), 2=Q(f32), 3=gain_db(f32), 4=bypass */

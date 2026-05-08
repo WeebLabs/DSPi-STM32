@@ -86,6 +86,7 @@ volatile uint32_t audio_underruns     = 0;
 extern MatrixMixer matrix_mixer;
 extern volatile float global_preamp_linear[NUM_INPUT_CHANNELS];
 extern volatile float master_volume_linear;
+extern volatile bool  bypass_master_eq;
 
 /* Per-output EQ channel index: Out0 → channel 2, Out1 → channel 3. */
 #define EQ_CH_OUT0    2
@@ -117,28 +118,33 @@ static void fill_half(int32_t *dst) {
     float out0_post_gain = (out0->enabled && !out0->mute) ? out0->gain_linear : 0.0f;
     float out1_post_gain = (out1->enabled && !out1->mute) ? out1->gain_linear : 0.0f;
 
-    /* M7d: per-input preamp + master volume snapshots — once per
-     * buffer-half so the inner sample loop stays branch-light. */
+    /* M7d: per-input preamp + master volume + bypass snapshots —
+     * once per buffer-half so the inner sample loop stays branch-light. */
     float preamp_l = global_preamp_linear[0];
     float preamp_r = global_preamp_linear[1];
     float master   = master_volume_linear;
+    bool  eq_bypass = bypass_master_eq;
 
     uint32_t i;
     for (i = 0; i < got; ++i) {
         float L = (float)pop_scratch[2*i + 0] * INT16_RECIP * preamp_l;
         float R = (float)pop_scratch[2*i + 1] * INT16_RECIP * preamp_r;
 
-        /* Per-input EQ */
-        L = dsp_process_channel(filters[0], L, 0);
-        R = dsp_process_channel(filters[1], R, 1);
+        /* Per-input EQ — skipped when master bypass is on. */
+        if (!eq_bypass) {
+            L = dsp_process_channel(filters[0], L, 0);
+            R = dsp_process_channel(filters[1], R, 1);
+        }
 
         /* Matrix mix → per-output samples */
         float o0 = L * g_l_to_o0 + R * g_r_to_o0;
         float o1 = L * g_l_to_o1 + R * g_r_to_o1;
 
-        /* Per-output EQ */
-        o0 = dsp_process_channel(filters[EQ_CH_OUT0], o0, EQ_CH_OUT0);
-        o1 = dsp_process_channel(filters[EQ_CH_OUT1], o1, EQ_CH_OUT1);
+        /* Per-output EQ — also skipped on master bypass. */
+        if (!eq_bypass) {
+            o0 = dsp_process_channel(filters[EQ_CH_OUT0], o0, EQ_CH_OUT0);
+            o1 = dsp_process_channel(filters[EQ_CH_OUT1], o1, EQ_CH_OUT1);
+        }
 
         /* Per-output gain + mute, then master volume ceiling. */
         o0 *= out0_post_gain * master;
