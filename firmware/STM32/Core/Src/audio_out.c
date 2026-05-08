@@ -31,6 +31,7 @@
 
 #include "main.h"
 #include "usb_audio.h"
+#include "dsp_pipeline.h"  /* M7c: per-channel biquad EQ */
 
 /* ---- Single shared DMA ring in AXI SRAM (DMA1 cannot reach DTCM) ---- */
 #define AUDIO_BUFFER_BASE  0x24000000UL
@@ -59,27 +60,88 @@ volatile uint32_t audio_underruns     = 0;
 /* ---------------------------------------------------------------------- */
 /* DMA half-buffer fill — drain USB ring, convert 16-bit → 24-bit         */
 /* ---------------------------------------------------------------------- */
+/* M7c DSP pipeline (per-sample for now; M7d may switch to block-based):
+ *
+ *   USB int16 → float [-1, +1]
+ *   ↓
+ *   Per-input EQ (channels 0/1)              ← Console "USB L/R" sliders
+ *   ↓
+ *   Matrix mixer (input → output crosspoint
+ *     gain × phase, summed per output)       ← Console "Routing" matrix
+ *   ↓
+ *   Per-output EQ (channels 2..N)            ← Console per-output PEQ
+ *   ↓
+ *   Per-output mute + linear gain stage      ← Console "Output Gain"
+ *   ↓
+ *   Float [-1, +1] → int32 right-aligned     → SAI DMA buffer
+ *
+ * The SAI only physically drives Outputs 0 + 1 in this build (SPDIF/PDM
+ * arrive in M8/M10) so we compute just those two outputs. The rest of
+ * the matrix is irrelevant — Console can drive it but nothing audibly
+ * happens until those outputs have hardware backing them. */
+
+#define INT16_RECIP   (1.0f / 32768.0f)
+#define FLOAT_TO_24   8388607.0f      /* 2^23 − 1 */
+
+extern MatrixMixer matrix_mixer;
+
+/* Per-output EQ channel index: Out0 → channel 2, Out1 → channel 3. */
+#define EQ_CH_OUT0    2
+#define EQ_CH_OUT1    3
+
 static void fill_half(int32_t *dst) {
-    /* Pop up to one half's worth of stereo frames. The ring may be
-     * starving, in which case we fill the rest with silence (0). */
     uint32_t got = usb_ring_pop_frames(pop_scratch, AUDIO_FRAMES_HALF);
     if (got < AUDIO_FRAMES_HALF) ++audio_underruns;
 
-    /* Convert int16 → int32 with 8-bit headroom shift so the host's
-     * 16-bit samples become 24-bit-equivalent values right-aligned in
-     * the int32 word. The SAI peripheral reads bits [23:0] for 24-bit
-     * datasize (RM0468 §34.4); putting the source value into bits [23:8]
-     * preserves audio level (16-bit −0 dBFS → 24-bit −0 dBFS) while
-     * keeping the data in the LSB-aligned half of the int32 the SAI
-     * expects. */
+    /* Snapshot the matrix crosspoints once per buffer-half (≪ 1 µs each)
+     * so the inner loop stays branch-light. Per-input gain folds in
+     * phase invert. */
+    MatrixCrosspoint *xp00 = &matrix_mixer.crosspoints[0][0];
+    MatrixCrosspoint *xp10 = &matrix_mixer.crosspoints[1][0];
+    MatrixCrosspoint *xp01 = &matrix_mixer.crosspoints[0][1];
+    MatrixCrosspoint *xp11 = &matrix_mixer.crosspoints[1][1];
+
+    float g_l_to_o0 = xp00->enabled
+        ? (xp00->phase_invert ? -xp00->gain_linear : xp00->gain_linear) : 0.0f;
+    float g_r_to_o0 = xp10->enabled
+        ? (xp10->phase_invert ? -xp10->gain_linear : xp10->gain_linear) : 0.0f;
+    float g_l_to_o1 = xp01->enabled
+        ? (xp01->phase_invert ? -xp01->gain_linear : xp01->gain_linear) : 0.0f;
+    float g_r_to_o1 = xp11->enabled
+        ? (xp11->phase_invert ? -xp11->gain_linear : xp11->gain_linear) : 0.0f;
+
+    OutputChannel *out0 = &matrix_mixer.outputs[0];
+    OutputChannel *out1 = &matrix_mixer.outputs[1];
+    float out0_post_gain = (out0->enabled && !out0->mute) ? out0->gain_linear : 0.0f;
+    float out1_post_gain = (out1->enabled && !out1->mute) ? out1->gain_linear : 0.0f;
+
     uint32_t i;
     for (i = 0; i < got; ++i) {
-        int32_t L = (int32_t)pop_scratch[2*i + 0] << 8;
-        int32_t R = (int32_t)pop_scratch[2*i + 1] << 8;
-        dst[2*i + 0] = L;
-        dst[2*i + 1] = R;
+        float L = (float)pop_scratch[2*i + 0] * INT16_RECIP;
+        float R = (float)pop_scratch[2*i + 1] * INT16_RECIP;
+
+        /* Per-input EQ */
+        L = dsp_process_channel(filters[0], L, 0);
+        R = dsp_process_channel(filters[1], R, 1);
+
+        /* Matrix mix → per-output samples */
+        float o0 = L * g_l_to_o0 + R * g_r_to_o0;
+        float o1 = L * g_l_to_o1 + R * g_r_to_o1;
+
+        /* Per-output EQ */
+        o0 = dsp_process_channel(filters[EQ_CH_OUT0], o0, EQ_CH_OUT0);
+        o1 = dsp_process_channel(filters[EQ_CH_OUT1], o1, EQ_CH_OUT1);
+
+        /* Per-output gain + mute (mute folded into gain == 0) */
+        o0 *= out0_post_gain;
+        o1 *= out1_post_gain;
+
+        /* Soft-clamp at ±1.0 before quantising to 24-bit. */
+        if (o0 >  1.0f) o0 =  1.0f; else if (o0 < -1.0f) o0 = -1.0f;
+        if (o1 >  1.0f) o1 =  1.0f; else if (o1 < -1.0f) o1 = -1.0f;
+        dst[2*i + 0] = (int32_t)(o0 * FLOAT_TO_24);
+        dst[2*i + 1] = (int32_t)(o1 * FLOAT_TO_24);
     }
-    /* Pad shortfall with silence. */
     for (; i < AUDIO_FRAMES_HALF; ++i) {
         dst[2*i + 0] = 0;
         dst[2*i + 1] = 0;

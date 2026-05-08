@@ -13,7 +13,7 @@ extern bool channel_bypassed[NUM_CHANNELS];  // true if all bands in channel are
 // RP2350: float, 170ms max delay (8192 samples)
 // RP2040: int32_t, 42ms max delay (2048 samples)
 #define NUM_DELAY_CHANNELS NUM_OUTPUT_CHANNELS
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
 extern float delay_lines[NUM_DELAY_CHANNELS][MAX_DELAY_SAMPLES];
 #else
 extern int32_t delay_lines[NUM_DELAY_CHANNELS][MAX_DELAY_SAMPLES];
@@ -29,7 +29,7 @@ void dsp_recalculate_all_filters(float sample_rate);
 void dsp_update_delay_samples(float sample_rate);
 
 // Optimized processing function
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
 float dsp_process_channel(Biquad * __restrict biquads, float input, uint8_t channel);
 void dsp_process_channel_block(Biquad * __restrict biquads, float * __restrict samples,
                                uint32_t count, uint8_t channel);

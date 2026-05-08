@@ -48,6 +48,7 @@ add_executable(${EXE}
     Core/Src/crossfeed.c
     Core/Src/leveller.c
     Core/Src/loudness.c
+    Core/Src/dsp_pipeline.c   # M7c: actual EQ / filter / delay engine
     # TinyUSB sources — kept as an explicit list so the milestone scope is
     # obvious. M3: device stack + dwc2 only — no built-in class drivers
     # (UAC1 is registered through usbd_app_driver_get_cb() in usb_audio.c).
@@ -68,6 +69,11 @@ target_compile_definitions(${EXE} PRIVATE
     USE_HAL_DRIVER
     STM32H723xx
     HSE_VALUE=25000000U     # WeAct MiniSTM32H723 V1.2 — confirmed in schematic
+    # Tell config.h to skip the .time_critical section attribute —
+    # the auto-generated linker doesn't define that section. M6c will
+    # add it (probably ITCM-resident). This define is consumed in our
+    # local copy of config.h to make DSP_TIME_CRITICAL a no-op.
+    DSPI_STM32_NO_TIME_CRITICAL_SECTION
 )
 
 # Optimization: -O2 by default; tighten to -Og for first bring-up if you want

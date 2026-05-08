@@ -23,6 +23,7 @@
 #include "main.h"
 #include "tusb.h"
 #include "usb_audio.h"
+#include "dsp_pipeline.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -54,6 +55,15 @@ int main(void) {
 
     USB_HW_Init();    /* GPIO + USB peripheral clock + voltage detector + NVIC */
     USB_App_Init();   /* tud_init(0) — TinyUSB device stack */
+
+    /* M7c: initialise the DSP filter recipes to FILTER_FLAT and compute
+     * coefficients for our 48 kHz Fs. Without these, biquads contain
+     * uninitialised garbage and the audio path produces NaN/silence.
+     * Then matrix_init_defaults() routes input L→Out0 and R→Out1 with
+     * those two outputs enabled so DSPi Console renders channel rows. */
+    dsp_init_default_filters();
+    dsp_recalculate_all_filters(48000.0f);
+    matrix_init_defaults();
 
     Audio_Init();     /* SAI1_A + DMA1_Stream0 + sine table fill */
     Audio_Start();    /* kick off circular DMA — 1 kHz tone on PE6 SD */

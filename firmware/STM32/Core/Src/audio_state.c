@@ -21,6 +21,7 @@
 #include "audio_input.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 /* -------- Per-input-channel preamp -------- */
 volatile float    global_preamp_db    [NUM_INPUT_CHANNELS] = { 0 };
@@ -58,17 +59,41 @@ volatile bool           leveller_reset_pending  = false;
 MatrixMixer matrix_mixer;
 uint8_t output_pins[NUM_PIN_OUTPUTS];
 
+/* M7c: stereo pass-through defaults (mirrors RP usb_audio.c::
+ * matrix_init_defaults). Without this Console sees zero enabled
+ * outputs and refuses to render any channel rows in its UI. */
+void matrix_init_defaults(void) {
+    memset(&matrix_mixer, 0, sizeof(matrix_mixer));
+
+    /* L → Out1, R → Out2 — first SPDIF stereo pair (Out 0-1).
+     * NOTE: on this STM32 build the only active physical output is
+     * SAI1 (PE6/PE3); the SPDIF/PDM channels are placeholders for
+     * wire-format compatibility with DSPi Console, not real outputs
+     * yet. The crosspoint config still drives the matrix-mixer DSP
+     * stage so Console reads back the expected default routing. */
+    matrix_mixer.crosspoints[0][0].enabled     = 1;
+    matrix_mixer.crosspoints[0][0].gain_db     = 0.0f;
+    matrix_mixer.crosspoints[0][0].gain_linear = 1.0f;
+    matrix_mixer.crosspoints[1][1].enabled     = 1;
+    matrix_mixer.crosspoints[1][1].gain_db     = 0.0f;
+    matrix_mixer.crosspoints[1][1].gain_linear = 1.0f;
+
+    matrix_mixer.outputs[0].enabled     = 1;
+    matrix_mixer.outputs[0].gain_linear = 1.0f;
+    matrix_mixer.outputs[1].enabled     = 1;
+    matrix_mixer.outputs[1].gain_linear = 1.0f;
+    for (int o = 2; o < NUM_OUTPUT_CHANNELS; ++o) {
+        matrix_mixer.outputs[o].enabled     = 0;
+        matrix_mixer.outputs[o].gain_linear = 1.0f;
+    }
+}
+
 /* -------- Channel names (per-preset, user-editable) -------- */
 char channel_names[NUM_CHANNELS][PRESET_NAME_LEN];
 
-/* -------- DSP filter recipe storage (per-channel, per-band)
- * The actual `Biquad filters[][]` is in M7c when dsp_pipeline.c
- * arrives. M7b only needs the recipe array because bulk_params
- * serialises it into the wire format. */
-EqParamPacket filter_recipes[NUM_CHANNELS][MAX_BANDS];
-
-/* -------- Per-channel delay (ms, host-set) -------- */
-float channel_delays_ms[NUM_CHANNELS] = { 0 };
+/* (filter_recipes[][], channel_delays_ms[], filters[][], delay_lines[][],
+ *  channel_bypassed[], delay_write_idx, channel_delay_samples[],
+ *  any_delay_active are all defined in dsp_pipeline.c — imported in M7c.) */
 
 /* -------- Output type config (SPDIF / I2S / PDM per output) --------
  * NUM_SPDIF_INSTANCES on RP2350 = 4. Output[0] = SPDIF by default;

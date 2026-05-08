@@ -570,9 +570,15 @@ extern volatile SystemStatusPacket global_status;
 
 // ----------------------------------------------------------------------------
 // RP2350-SPECIFIC: Force time-critical functions into RAM
-// RP2350 has different XIP cache behavior that causes audio underruns
+// RP2350 has different XIP cache behavior that causes audio underruns.
+// STM32 build (M7c) opts out of the section attribute until M6c adds an
+// ITCM-resident section to the custom linker script.
 // ----------------------------------------------------------------------------
-#define DSP_TIME_CRITICAL __attribute__((section(".time_critical")))
+#if defined(DSPI_STM32_NO_TIME_CRITICAL_SECTION)
+#  define DSP_TIME_CRITICAL    /* no-op until M6c custom LD */
+#else
+#  define DSP_TIME_CRITICAL __attribute__((section(".time_critical")))
+#endif
 
 // ----------------------------------------------------------------------------
 // UTILS

@@ -77,6 +77,11 @@ extern char channel_names[NUM_CHANNELS][PRESET_NAME_LEN];
  * SAI output gain stage. */
 void update_master_volume(float db);
 
+/* M7c: stereo pass-through default — input L→Out0, R→Out1, only those
+ * two outputs enabled. Without this the matrix mixer is all zeros and
+ * Console renders nothing. */
+void matrix_init_defaults(void);
+
 /* USB→SAI ring (M6a). The UAC1 ISO OUT EP writes 16-bit stereo PCM
  * frames here; audio_out.c reads them out into the SAI ping-pong
  * buffer. One "frame" = one stereo pair = two int16 samples = 4 bytes.
