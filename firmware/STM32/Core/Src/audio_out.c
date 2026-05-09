@@ -110,6 +110,25 @@ extern bool     any_delay_active;
  * the latest per-fill-half block peak in place — Console smooths visually. */
 extern volatile SystemStatusPacket global_status;
 
+/* M7k: CPU metering via DWT cycle counter.
+ *
+ * The audio path runs in 192-sample halves at 48 kHz → one fill_half call
+ * every 4 ms. At SYSCLK=550 MHz that's a 2,200,000-cycle budget. We snap
+ * the cycle counter at the top + bottom of fill_half, accumulate the
+ * delta, and every CPU_METER_BLOCKS calls (≈ once per 0.5 s) divide by
+ * the total budget to produce an integer % (0..100). The result lives
+ * in global_status.cpu0_load and Console pulls it via REQ_GET_STATUS
+ * wValue=9. cpu1_load stays 0 (no Core 1 on STM32).
+ *
+ * Two reasons cycles, not microseconds: (a) DWT cycle count is the
+ * cheapest read on M7 (single MRC), zero peripheral dependency; (b) it
+ * gives us the metric users actually care about — "what fraction of the
+ * core am I using?" — without floating-point time math in the hot path.
+ */
+#define CPU_METER_BLOCKS         128U  /* ~0.5 s at 192 frames / 48 kHz */
+#define CPU_BUDGET_CYCLES_PER_HALF \
+        ((uint32_t)((uint64_t)550000000U * AUDIO_FRAMES_HALF / 48000U))
+
 /* M7i: loudness compensation — per-channel SVF state for the 2-biquad
  * shelf cascade. State lives here (not in loudness.c) because it's a
  * stateful run-time object that rolls samples; the imported loudness.c
@@ -136,6 +155,11 @@ static float buf_o1[AUDIO_FRAMES_HALF];
 #define EQ_CH_OUT1    3
 
 static void fill_half(int32_t *dst) {
+    /* M7k: snap cycle count at entry; computed at exit and accumulated
+     * into a per-window total that gets converted to a % every
+     * CPU_METER_BLOCKS calls. Single MRC, ~1 cycle. */
+    uint32_t cpu_t0 = DWT->CYCCNT;
+
     uint32_t got = usb_ring_pop_frames(pop_scratch, AUDIO_FRAMES_HALF);
     if (got < AUDIO_FRAMES_HALF) ++audio_underruns;
 
@@ -363,6 +387,27 @@ static void fill_half(int32_t *dst) {
     global_status.peaks[CH_OUT_2]        = (uint16_t)(pk_o1   * 32767.0f);
     if (clip0) global_status.clip_flags |= (1u << CH_OUT_1);
     if (clip1) global_status.clip_flags |= (1u << CH_OUT_2);
+
+    /* M7k: cycle-count delta for this call. The DWT counter is 32-bit
+     * free-running at SYSCLK; the natural unsigned subtract handles
+     * wrap correctly as long as the call took less than 2^32 cycles
+     * (≈ 7.8 s at 550 MHz — never going to happen). */
+    static uint32_t cpu_cycle_acc   = 0;
+    static uint16_t cpu_block_count = 0;
+    cpu_cycle_acc   += DWT->CYCCNT - cpu_t0;
+    cpu_block_count += 1;
+    if (cpu_block_count >= CPU_METER_BLOCKS) {
+        /* avg cycles / call * 100 / budget = % load. Integer math:
+         *   load_pct = cpu_cycle_acc * 100 / (CPU_METER_BLOCKS * budget).
+         * Numerator fits in u32 because cpu_cycle_acc <= 128 * budget
+         * (= 128 * 2.2 M = 281 M, well under 2^32). */
+        uint32_t pct = (cpu_cycle_acc * 100U) /
+                       (CPU_METER_BLOCKS * CPU_BUDGET_CYCLES_PER_HALF);
+        if (pct > 100U) pct = 100U;
+        global_status.cpu0_load = (uint8_t)pct;
+        cpu_cycle_acc   = 0;
+        cpu_block_count = 0;
+    }
 }
 
 void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai) {

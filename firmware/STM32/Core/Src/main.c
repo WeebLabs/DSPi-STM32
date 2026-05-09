@@ -75,6 +75,14 @@ int main(void) {
      * buffer). */
     SCB_EnableICache();
 
+    /* M7k: enable the DWT cycle counter. Used by audio_out.c's CPU
+     * metering and any future cycle-accurate profiling. TRCENA gates the
+     * entire DWT block; CYCCNTENA starts the counter ticking at SYSCLK.
+     * The counter is free-running 32-bit, no IRQ. */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT       = 0;
+    DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;
+
     HAL_Init();
 
     /* Initialise the heartbeat LED *before* the clock tree so any fault in
