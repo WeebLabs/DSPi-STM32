@@ -37,8 +37,20 @@
 #include "loudness.h"      /* M7i: loudness compensation */
 #include <math.h>          /* M7e: fabsf for level meters */
 
-/* ---- Single shared DMA ring in AXI SRAM (DMA1 cannot reach DTCM) ---- */
-#define AUDIO_BUFFER_BASE  0x24000000UL
+/* ---- Per-sub-block DMA rings in AXI SRAM (DMA1 cannot reach DTCM) ----
+ *
+ * Phase 1 (4 independent stereo slots): SAI1_A and SAI1_B each get their
+ * own ping-pong buffer so the two physical pin pairs can carry DIFFERENT
+ * stereo signals. The earlier build had both DMAs reading the same
+ * audio_buf, which collapsed PE6 and PE3 to identical data.
+ *
+ * AXI SRAM layout (320 KB at 0x24000000):
+ *   0x24000000  audio_buf_A (3 KB) — SAI1_A / Out0+1
+ *   0x24001000  audio_buf_B (3 KB) — SAI1_B / Out2+3
+ *   0x24004000  flash_mirror (48 KB) — preset region (M11)
+ * Plenty of room for SAI2 buffers in phase 2 without touching the mirror. */
+#define AUDIO_BUFFER_BASE_A  0x24000000UL
+#define AUDIO_BUFFER_BASE_B  0x24001000UL
 
 /* 192 stereo frames per ping-pong half × 2 halves × 2 ch = 768 int32 words.
  * 192 frames @ 48 kHz = 4 ms per half — comfortably above any HAL ISR
@@ -47,7 +59,8 @@
 #define AUDIO_FRAMES_TOTAL   (AUDIO_FRAMES_HALF * 2)
 #define AUDIO_WORDS_TOTAL    (AUDIO_FRAMES_TOTAL * 2)  /* L+R */
 
-static int32_t * const audio_buf = (int32_t *)AUDIO_BUFFER_BASE;
+static int32_t * const audio_buf_a = (int32_t *)AUDIO_BUFFER_BASE_A;
+static int32_t * const audio_buf_b = (int32_t *)AUDIO_BUFFER_BASE_B;
 
 /* Scratch for one half's worth of stereo 16-bit samples popped from the
  * ring; converted to 24-bit-right-aligned in place into audio_buf[]. */
@@ -145,16 +158,34 @@ static LevellerCoeffs leveller_coeffs;
  * Each stage operates on the full block in-place. AXI SRAM-resident
  * via the shared audio_buf placement isn't required here (these are
  * CPU-only) so they live as plain BSS in DTCM (faster, no DMA). */
-static float buf_l[AUDIO_FRAMES_HALF];
-static float buf_r[AUDIO_FRAMES_HALF];
-static float buf_o0[AUDIO_FRAMES_HALF];
-static float buf_o1[AUDIO_FRAMES_HALF];
+/* Phase 1: per-stage scratch buffers placed in AXI SRAM via fixed
+ * pointers so the DTCM budget isn't blown out by 4× per-output stereo
+ * scratch. AXI SRAM map (after audio_buf_a/_b at 0..0x1FFF):
+ *   0x24002000  buf_l       (768 B)
+ *   0x24002300  buf_r       (768 B)
+ *   0x24002600  buf_o0      (768 B)
+ *   0x24002900  buf_o1      (768 B)
+ *   0x24002C00  buf_o2      (768 B)
+ *   0x24002F00  buf_o3      (768 B)
+ *   0x24004000  flash_mirror (48 KB) — already there
+ * Total scratch = 4.5 KB, fits comfortably below the mirror at 0x4000. */
+#define DSP_SCRATCH_BASE  0x24002000UL
+static float * const buf_l  = (float *)(DSP_SCRATCH_BASE + 0 * 0x300);
+static float * const buf_r  = (float *)(DSP_SCRATCH_BASE + 1 * 0x300);
+static float * const buf_o0 = (float *)(DSP_SCRATCH_BASE + 2 * 0x300);
+static float * const buf_o1 = (float *)(DSP_SCRATCH_BASE + 3 * 0x300);
+static float * const buf_o2 = (float *)(DSP_SCRATCH_BASE + 4 * 0x300);
+static float * const buf_o3 = (float *)(DSP_SCRATCH_BASE + 5 * 0x300);
 
-/* Per-output EQ channel index: Out0 → channel 2, Out1 → channel 3. */
+/* Per-output EQ channel index: Out0 → CH 2, Out1 → CH 3, Out2 → CH 4,
+ * Out3 → CH 5. (CH_OUT_n already exist as global config defines but
+ * they're 1-indexed-by-pin in the project naming.) */
 #define EQ_CH_OUT0    2
 #define EQ_CH_OUT1    3
+#define EQ_CH_OUT2    4
+#define EQ_CH_OUT3    5
 
-static void fill_half(int32_t *dst) {
+static void fill_half(int32_t *dst_a, int32_t *dst_b) {
     /* M7k: snap cycle count at entry; computed at exit and accumulated
      * into a per-window total that gets converted to a % every
      * CPU_METER_BLOCKS calls. Single MRC, ~1 cycle. */
@@ -165,25 +196,32 @@ static void fill_half(int32_t *dst) {
 
     /* Snapshot the matrix crosspoints once per buffer-half (≪ 1 µs each)
      * so the inner loop stays branch-light. Per-input gain folds in
-     * phase invert. */
-    MatrixCrosspoint *xp00 = &matrix_mixer.crosspoints[0][0];
-    MatrixCrosspoint *xp10 = &matrix_mixer.crosspoints[1][0];
-    MatrixCrosspoint *xp01 = &matrix_mixer.crosspoints[0][1];
-    MatrixCrosspoint *xp11 = &matrix_mixer.crosspoints[1][1];
+     * phase invert. Phase 1: snapshot all FOUR outputs so SAI1_B carries
+     * Out2/Out3 instead of mirroring Out0/Out1. */
+    #define XP_GAIN(in, out) \
+        (matrix_mixer.crosspoints[(in)][(out)].enabled \
+            ? (matrix_mixer.crosspoints[(in)][(out)].phase_invert \
+                ? -matrix_mixer.crosspoints[(in)][(out)].gain_linear \
+                :  matrix_mixer.crosspoints[(in)][(out)].gain_linear) \
+            : 0.0f)
+    float g_l_to_o0 = XP_GAIN(0, 0);
+    float g_r_to_o0 = XP_GAIN(1, 0);
+    float g_l_to_o1 = XP_GAIN(0, 1);
+    float g_r_to_o1 = XP_GAIN(1, 1);
+    float g_l_to_o2 = XP_GAIN(0, 2);
+    float g_r_to_o2 = XP_GAIN(1, 2);
+    float g_l_to_o3 = XP_GAIN(0, 3);
+    float g_r_to_o3 = XP_GAIN(1, 3);
+    #undef XP_GAIN
 
-    float g_l_to_o0 = xp00->enabled
-        ? (xp00->phase_invert ? -xp00->gain_linear : xp00->gain_linear) : 0.0f;
-    float g_r_to_o0 = xp10->enabled
-        ? (xp10->phase_invert ? -xp10->gain_linear : xp10->gain_linear) : 0.0f;
-    float g_l_to_o1 = xp01->enabled
-        ? (xp01->phase_invert ? -xp01->gain_linear : xp01->gain_linear) : 0.0f;
-    float g_r_to_o1 = xp11->enabled
-        ? (xp11->phase_invert ? -xp11->gain_linear : xp11->gain_linear) : 0.0f;
-
-    OutputChannel *out0 = &matrix_mixer.outputs[0];
-    OutputChannel *out1 = &matrix_mixer.outputs[1];
-    float out0_post_gain = (out0->enabled && !out0->mute) ? out0->gain_linear : 0.0f;
-    float out1_post_gain = (out1->enabled && !out1->mute) ? out1->gain_linear : 0.0f;
+    #define POST_GAIN(out) \
+        ((matrix_mixer.outputs[(out)].enabled && !matrix_mixer.outputs[(out)].mute) \
+            ? matrix_mixer.outputs[(out)].gain_linear : 0.0f)
+    float out0_post_gain = POST_GAIN(0);
+    float out1_post_gain = POST_GAIN(1);
+    float out2_post_gain = POST_GAIN(2);
+    float out3_post_gain = POST_GAIN(3);
+    #undef POST_GAIN
 
     /* M7d: per-input preamp + master volume + bypass snapshots —
      * once per buffer-half so the per-sample loops stay branch-light. */
@@ -294,18 +332,24 @@ static void fill_half(int32_t *dst) {
                                buf_l, buf_r, AUDIO_FRAMES_HALF);
     }
 
-    /* === Stage 5: matrix mixer → per-output buffers. */
+    /* === Stage 5: matrix mixer → per-output buffers (4 stereo slots). */
     for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
         buf_o0[k] = buf_l[k] * g_l_to_o0 + buf_r[k] * g_r_to_o0;
         buf_o1[k] = buf_l[k] * g_l_to_o1 + buf_r[k] * g_r_to_o1;
+        buf_o2[k] = buf_l[k] * g_l_to_o2 + buf_r[k] * g_r_to_o2;
+        buf_o3[k] = buf_l[k] * g_l_to_o3 + buf_r[k] * g_r_to_o3;
     }
 
-    /* === Stage 6: per-output EQ (block-based, channels 2/3). */
+    /* === Stage 6: per-output EQ (block-based, channels 2..5). */
     if (!eq_bypass) {
         dsp_process_channel_block(filters[EQ_CH_OUT0], buf_o0,
                                   AUDIO_FRAMES_HALF, EQ_CH_OUT0);
         dsp_process_channel_block(filters[EQ_CH_OUT1], buf_o1,
                                   AUDIO_FRAMES_HALF, EQ_CH_OUT1);
+        dsp_process_channel_block(filters[EQ_CH_OUT2], buf_o2,
+                                  AUDIO_FRAMES_HALF, EQ_CH_OUT2);
+        dsp_process_channel_block(filters[EQ_CH_OUT3], buf_o3,
+                                  AUDIO_FRAMES_HALF, EQ_CH_OUT3);
     }
 
     /* === Stage 6.5: per-output delay (circular delay-line, mirrors RP
@@ -321,23 +365,21 @@ static void fill_half(int32_t *dst) {
      *                large enough (MAX_DELAY_SAMPLES samples) that this
      *                is harmless. */
     if (any_delay_active) {
-        const int32_t dly0 = channel_delay_samples[0];
-        const int32_t dly1 = channel_delay_samples[1];
-        if (dly0 > 0) {
-            float *dline = delay_lines[0];
+        /* Phase 1: extend per-output delay to 4 outputs. delay_lines[]
+         * already has 9 entries (NUM_DELAY_CHANNELS), so no allocation
+         * change. Each output starts from the SAME delay_write_idx; the
+         * global index advances ONCE at the end so all four lines stay
+         * sample-aligned. */
+        float * const buf_outs[4] = { buf_o0, buf_o1, buf_o2, buf_o3 };
+        for (int out = 0; out < 4; ++out) {
+            int32_t dly = channel_delay_samples[out];
+            if (dly <= 0) continue;
+            float *dline = delay_lines[out];
             uint32_t widx = delay_write_idx;
+            float *bo = buf_outs[out];
             for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
-                dline[widx] = buf_o0[k];
-                buf_o0[k]   = dline[(widx - dly0) & MAX_DELAY_MASK];
-                widx = (widx + 1) & MAX_DELAY_MASK;
-            }
-        }
-        if (dly1 > 0) {
-            float *dline = delay_lines[1];
-            uint32_t widx = delay_write_idx;
-            for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
-                dline[widx] = buf_o1[k];
-                buf_o1[k]   = dline[(widx - dly1) & MAX_DELAY_MASK];
+                dline[widx] = bo[k];
+                bo[k]       = dline[(widx - dly) & MAX_DELAY_MASK];
                 widx = (widx + 1) & MAX_DELAY_MASK;
             }
         }
@@ -345,11 +387,13 @@ static void fill_half(int32_t *dst) {
     }
 
     /* === Stage 7: per-output gain + master volume + clamp + 24-bit
-     *               quantisation into the SAI ping-pong slot.  Peaks
-     *               folded into the same loop so we don't re-traverse. */
+     *               quantisation. Phase 1: 4 outputs, written into two
+     *               ping-pong buffers (Out0/Out1 -> dst_a interleaved
+     *               L+R, Out2/Out3 -> dst_b interleaved L+R). Peaks +
+     *               clip detection folded into the same loop. */
     float pk_in_l = 0.0f, pk_in_r = 0.0f;
-    float pk_o0   = 0.0f, pk_o1   = 0.0f;
-    bool  clip0   = false, clip1  = false;
+    float pk_o0 = 0.0f, pk_o1 = 0.0f, pk_o2 = 0.0f, pk_o3 = 0.0f;
+    bool  clip0 = false, clip1 = false, clip2 = false, clip3 = false;
 
     for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
         /* Pre-gain "master/input" peaks (track buf_l/buf_r, post-EQ but
@@ -360,18 +404,29 @@ static void fill_half(int32_t *dst) {
 
         float o0 = buf_o0[k] * out0_post_gain * master;
         float o1 = buf_o1[k] * out1_post_gain * master;
+        float o2 = buf_o2[k] * out2_post_gain * master;
+        float o3 = buf_o3[k] * out3_post_gain * master;
 
         /* Clip detection BEFORE clamp (RP convention — flag if any sample
          * tried to exceed full-scale before the limiter hides it). */
         float ao0 = fabsf(o0); if (ao0 > pk_o0) pk_o0 = ao0;
         float ao1 = fabsf(o1); if (ao1 > pk_o1) pk_o1 = ao1;
+        float ao2 = fabsf(o2); if (ao2 > pk_o2) pk_o2 = ao2;
+        float ao3 = fabsf(o3); if (ao3 > pk_o3) pk_o3 = ao3;
         if (ao0 > CLIP_THRESH_F) clip0 = true;
         if (ao1 > CLIP_THRESH_F) clip1 = true;
+        if (ao2 > CLIP_THRESH_F) clip2 = true;
+        if (ao3 > CLIP_THRESH_F) clip3 = true;
 
         if (o0 >  1.0f) o0 =  1.0f; else if (o0 < -1.0f) o0 = -1.0f;
         if (o1 >  1.0f) o1 =  1.0f; else if (o1 < -1.0f) o1 = -1.0f;
-        dst[2*k + 0] = (int32_t)(o0 * FLOAT_TO_24);
-        dst[2*k + 1] = (int32_t)(o1 * FLOAT_TO_24);
+        if (o2 >  1.0f) o2 =  1.0f; else if (o2 < -1.0f) o2 = -1.0f;
+        if (o3 >  1.0f) o3 =  1.0f; else if (o3 < -1.0f) o3 = -1.0f;
+
+        dst_a[2*k + 0] = (int32_t)(o0 * FLOAT_TO_24);
+        dst_a[2*k + 1] = (int32_t)(o1 * FLOAT_TO_24);
+        dst_b[2*k + 0] = (int32_t)(o2 * FLOAT_TO_24);
+        dst_b[2*k + 1] = (int32_t)(o3 * FLOAT_TO_24);
     }
 
     /* Publish to global_status — converted u16 [0..32767]. clip_flags is a
@@ -381,12 +436,18 @@ static void fill_half(int32_t *dst) {
     if (pk_in_r > 1.0f) pk_in_r = 1.0f;
     if (pk_o0   > 1.0f) pk_o0   = 1.0f;
     if (pk_o1   > 1.0f) pk_o1   = 1.0f;
+    if (pk_o2   > 1.0f) pk_o2   = 1.0f;
+    if (pk_o3   > 1.0f) pk_o3   = 1.0f;
     global_status.peaks[CH_MASTER_LEFT]  = (uint16_t)(pk_in_l * 32767.0f);
     global_status.peaks[CH_MASTER_RIGHT] = (uint16_t)(pk_in_r * 32767.0f);
     global_status.peaks[CH_OUT_1]        = (uint16_t)(pk_o0   * 32767.0f);
     global_status.peaks[CH_OUT_2]        = (uint16_t)(pk_o1   * 32767.0f);
+    global_status.peaks[CH_OUT_3]        = (uint16_t)(pk_o2   * 32767.0f);
+    global_status.peaks[CH_OUT_4]        = (uint16_t)(pk_o3   * 32767.0f);
     if (clip0) global_status.clip_flags |= (1u << CH_OUT_1);
     if (clip1) global_status.clip_flags |= (1u << CH_OUT_2);
+    if (clip2) global_status.clip_flags |= (1u << CH_OUT_3);
+    if (clip3) global_status.clip_flags |= (1u << CH_OUT_4);
 
     /* M7k: cycle-count delta for this call. The DWT counter is 32-bit
      * free-running at SYSCLK; the natural unsigned subtract handles
@@ -411,19 +472,22 @@ static void fill_half(int32_t *dst) {
 }
 
 void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai) {
-    /* Only A drives the fill — B reads the same buffer from its own DMA.
-     * A and B's half-cplt callbacks fire essentially simultaneously
-     * (they share the BCK/FS clocks); a stray B-side callback would
-     * just refill the same data redundantly, so we ignore it. */
+    /* Only A drives the fill — B's callback fires essentially
+     * simultaneously (shared BCK/FS) and would just refill the same
+     * halves redundantly. We refill BOTH ping-pong halves (A and B) in
+     * one fill_half call so all 4 output channels stay sample-aligned
+     * across the two SAI sub-blocks. */
     if (hsai == &hsai_BlockA1) {
-        fill_half(&audio_buf[0]);
+        fill_half(&audio_buf_a[0],
+                  &audio_buf_b[0]);
     }
     ++audio_dma_callbacks;
 }
 
 void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai) {
     if (hsai == &hsai_BlockA1) {
-        fill_half(&audio_buf[AUDIO_FRAMES_HALF * 2]);
+        fill_half(&audio_buf_a[AUDIO_FRAMES_HALF * 2],
+                  &audio_buf_b[AUDIO_FRAMES_HALF * 2]);
     }
     ++audio_dma_callbacks;
 }
@@ -556,10 +620,11 @@ void Audio_Init(void) {
      * still points at A's stream and B's buffer never flows. */
     __HAL_LINKDMA(&hsai_BlockB1, hdmatx, hdma_sai1_b);
 
-    /* Pre-fill the shared buffer with silence so the first BCK edges
-     * after Audio_Start ship zero samples until USB starts delivering. */
+    /* Pre-fill both buffers with silence so the first BCK edges after
+     * Audio_Start ship zero samples until USB starts delivering. */
     for (uint32_t i = 0; i < AUDIO_WORDS_TOTAL; ++i) {
-        audio_buf[i] = 0;
+        audio_buf_a[i] = 0;
+        audio_buf_b[i] = 0;
     }
 
     /* M7d: init crossfeed + leveller state + initial coefficients.
@@ -576,23 +641,24 @@ void Audio_Init(void) {
 }
 
 void Audio_Start(void) {
-    /* Both A and B stream from the SAME ring (audio_buf). Two DMA
-     * streams reading from the same AXI SRAM range is fine — the AXI
-     * arbiter handles concurrent reads, and we only WRITE during the
-     * half-cplt callback (when DMA is reading the OTHER half).
+    /* Phase 1: each sub-block streams from its OWN AXI SRAM ring.
+     * SAI1_A drains audio_buf_a (Out0/Out1 stereo on PE6); SAI1_B drains
+     * audio_buf_b (Out2/Out3 stereo on PE3). Two DMAs targeting separate
+     * SRAM addresses — no contention beyond AXI bus bandwidth (trivial
+     * at 6 MB/s combined).
      *
      * Start the synchronous slave (B) FIRST so its DMA + SAIEN are
      * armed and waiting on A's BCK/FS edges. Then start A — the moment
      * A's SAIEN goes high, BCK/FS begin toggling and B shifts out its
      * first sample on the same edge as A's, giving sample-aligned
-     * output. */
+     * output across both pin pairs. */
     if (HAL_SAI_Transmit_DMA(&hsai_BlockB1,
-                             (uint8_t *)audio_buf,
+                             (uint8_t *)audio_buf_b,
                              AUDIO_WORDS_TOTAL) != HAL_OK) {
         Error_Handler();
     }
     if (HAL_SAI_Transmit_DMA(&hsai_BlockA1,
-                             (uint8_t *)audio_buf,
+                             (uint8_t *)audio_buf_a,
                              AUDIO_WORDS_TOTAL) != HAL_OK) {
         Error_Handler();
     }

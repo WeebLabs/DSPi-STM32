@@ -87,18 +87,22 @@ void matrix_init_defaults(void) {
      * wire-format compatibility with DSPi Console, not real outputs
      * yet. The crosspoint config still drives the matrix-mixer DSP
      * stage so Console reads back the expected default routing. */
-    matrix_mixer.crosspoints[0][0].enabled     = 1;
-    matrix_mixer.crosspoints[0][0].gain_db     = 0.0f;
-    matrix_mixer.crosspoints[0][0].gain_linear = 1.0f;
-    matrix_mixer.crosspoints[1][1].enabled     = 1;
-    matrix_mixer.crosspoints[1][1].gain_db     = 0.0f;
-    matrix_mixer.crosspoints[1][1].gain_linear = 1.0f;
-
-    matrix_mixer.outputs[0].enabled     = 1;
-    matrix_mixer.outputs[0].gain_linear = 1.0f;
-    matrix_mixer.outputs[1].enabled     = 1;
-    matrix_mixer.outputs[1].gain_linear = 1.0f;
-    for (int o = 2; o < NUM_OUTPUT_CHANNELS; ++o) {
+    /* Phase 1: route input L/R into the FIRST FOUR outputs so all four
+     * SAI channels (Out0..3) carry signal out-of-the-box. The original
+     * RP build only enabled Out0/Out1 because it ran on a single shared
+     * SAI buffer where Out2..N were silent placeholders; the STM32
+     * Phase-1 path drives SAI1_A from Out0+1 and SAI1_B from Out2+3
+     * with INDEPENDENT data, so we want Out2/Out3 audible by default. */
+    for (int out = 0; out < 4; ++out) {
+        int in_ch = out & 1;   /* L for even outs, R for odd */
+        matrix_mixer.crosspoints[in_ch][out].enabled     = 1;
+        matrix_mixer.crosspoints[in_ch][out].gain_db     = 0.0f;
+        matrix_mixer.crosspoints[in_ch][out].gain_linear = 1.0f;
+        matrix_mixer.outputs[out].enabled     = 1;
+        matrix_mixer.outputs[out].gain_linear = 1.0f;
+    }
+    /* Outs 4..N stay disabled (no hardware behind them yet). */
+    for (int o = 4; o < NUM_OUTPUT_CHANNELS; ++o) {
         matrix_mixer.outputs[o].enabled     = 0;
         matrix_mixer.outputs[o].gain_linear = 1.0f;
     }
