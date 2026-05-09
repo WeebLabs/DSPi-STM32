@@ -28,6 +28,8 @@
 #include "loudness.h"
 #include "notify.h"
 #include "w25q.h"
+#include "flash_clkdiv.h"
+#include "flash_storage.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -98,10 +100,16 @@ int main(void) {
     matrix_init_defaults();
     init_default_channel_names();   /* "USB L/R", "SPDIF n L/R", "PDM" */
 
-    /* M11: W25Q64 SPI flash on SPI3.  Stash JEDEC ID for diagnostics —
-     * the actual preset wiring lives behind dspi_flash_range_* and gets
-     * bolted on once we trust the SPI link. */
+    /* M11: W25Q64 SPI flash on SPI1. Probe JEDEC, populate the 48 KB
+     * RAM mirror that flash_storage.c reads from via XIP_BASE, then run
+     * preset_boot_load() to apply the user's persisted slot (or factory
+     * defaults if nothing saved yet / flash absent). Order matters:
+     * w25q_init -> dspi_flash_init -> preset_boot_load. */
     w25q_present = w25q_init(w25q_jedec_id);
+    if (w25q_present) {
+        dspi_flash_init();      /* read 48 KB preset region into mirror */
+        preset_boot_load();     /* apply startup slot (or factory) */
+    }
 
     Audio_Init();     /* SAI1_A + DMA1_Stream0 + sine table fill */
     Audio_Start();    /* kick off circular DMA — 1 kHz tone on PE6 SD */

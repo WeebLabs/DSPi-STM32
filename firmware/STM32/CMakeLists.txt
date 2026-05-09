@@ -44,6 +44,8 @@ add_executable(${EXE}
     Core/Src/temp_sensor.c
     # M11: W25Q64 SPI NOR driver (preset flash backing store)
     Core/Src/w25q.c
+    Core/Src/flash_clkdiv_stm32.c
+    Core/Src/flash_storage.c
     # M7b: DSP-pipeline state + portable DSP source files
     Core/Src/audio_state.c
     Core/Src/audio_input.c

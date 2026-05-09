@@ -201,6 +201,48 @@ volatile bool bypass_master_eq = false;
  * read by nothing in this build. Will become live in M9 SPDIF RX. */
 volatile bool spdif_rx_pin_change_pending = false;
 
+/* M11: globals flash_storage.c reaches for. STM32 has no SPDIF RX or
+ * Core 1 yet, so these are placeholder values that flash_storage.c can
+ * round-trip through preset save/load without affecting the audio path.
+ *   spdif_rx_pin     — last applied SPDIF input GPIO; stub default
+ *   preset_mute_gain — multiplied into output gain during preset switch
+ *                      to silence the audio briefly. Defaults to 1.0
+ *                      (no attenuation); flash_storage.c will dip it
+ *                      to 0 across a load and ramp it back. */
+/* spdif_rx_pin already defined in audio_input.c — don't duplicate. */
+volatile float preset_mute_gain = 1.0f;
+
+/* M11: USB-feedback nominal value (Q10.14) — flash_storage.c writes the
+ * live `feedback_10_14` accumulator back to nominal across a preset
+ * load to drop any drift the previous preset had built up. STM32 path
+ * doesn't run a feedback servo yet (just sends a constant 48.0 fpp),
+ * so these are decorative; declared here so flash_storage.c links. */
+volatile uint32_t feedback_10_14         = (48u << 14) / 1000u;
+volatile uint32_t nominal_feedback_10_14 = (48u << 14) / 1000u;
+Core1Mode core1_mode = CORE1_MODE_IDLE;
+Core1Mode derive_core1_mode(void) { return CORE1_MODE_IDLE; }
+
+/* M11: last preset_* return code, captured by REQ_PRESET_SAVE / LOAD /
+ * DELETE for the 0xFB debug GET. PRESET_OK = 0, anything else = error. */
+volatile uint8_t last_preset_result = 0;
+
+/* M11: prepare_pipeline_reset() — RP uses this to mute audio + flush USB
+ * ring across a preset boundary. STM32 path raises preset_loading (the
+ * audio callback already gates output on it) and zeros preset_mute_gain
+ * for the requested sample window. */
+extern volatile bool preset_loading;
+void prepare_pipeline_reset(uint32_t mute_samples) {
+    (void)mute_samples;
+    preset_loading   = true;
+    preset_mute_gain = 0.0f;
+}
+
+void usb_audio_drain_ring(void) {
+    /* Consumed by the SAI half-cplt callback already; no explicit drain
+     * needed on STM32 — this exists as a no-op so flash_storage.c can
+     * call it before swapping state. */
+}
+
 /* -------- Stub: master volume update --------
  * Wired to the real SAI output-gain stage in M7c. For M7b we just clamp,
  * store, and accept the value so bulk_params SETs don't fail. The

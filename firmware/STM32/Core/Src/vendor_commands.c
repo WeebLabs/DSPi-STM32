@@ -25,6 +25,8 @@
 #include "usb_audio.h"   /* update_master_volume, AudioState, channel_names */
 #include "audio_input.h" /* INPUT_SOURCE_USB */
 #include "notify.h"      /* notify_param_write — M7j */
+#include "flash_storage.h"  /* preset_save / load / delete / etc. — M11 */
+#include "w25q.h"           /* debug GETs probe W25Q directly */
 #include <stddef.h>      /* offsetof */
 
 extern uint8_t channel_band_counts[NUM_CHANNELS];
@@ -328,6 +330,21 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                             (tusb_control_request_t *)req,
                                             buf, sizeof(buf));
                 }
+                case 0xFB: {  /* DEBUG (M11): last preset_* return code +
+                               * also dump first 16 bytes of W25Q slot 0 so
+                               * we can see whether the on-chip data was
+                               * actually written. */
+                    extern volatile uint8_t last_preset_result;
+                    static uint8_t buf[20];
+                    buf[0] = last_preset_result;
+                    buf[1] = 0; buf[2] = 0; buf[3] = 0;
+                    /* Read W25Q at offset 4096 (SLOT 0) directly — bypass
+                     * the mirror so we can see what physically landed. */
+                    w25q_read(4096, &buf[4], 16);
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
                 case 0xFC: {  /* DEBUG (M11): W25Q sector RW round-trip test.
                                * Erases sector at byte offset 0, programs an
                                * 8-byte signature, reads back, returns the 8
@@ -527,33 +544,92 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                  *   [6]   master_volume_mode = 0
                  */
                 case REQ_PRESET_GET_DIR: {
-                    static uint8_t dir[7] = { 0 };
+                    /* M11: pull live directory from flash_storage.c.
+                     * Layout (7 bytes):
+                     *   [0..1] slot_occupied (u16, bit n = slot n filled)
+                     *   [2]    startup_mode  (0 = specified, 1 = last_active)
+                     *   [3]    default_slot  (0..9, applies when mode=0)
+                     *   [4]    last_active   (last loaded/saved slot)
+                     *   [5]    include_pins  (0/1)
+                     *   [6]    master_volume_mode (0/1) */
+                    static uint8_t dir[7];
+                    uint16_t occ; uint8_t m, d, la, inc_pins, mv_mode;
+                    preset_get_directory(&occ, &m, &d, &la, &inc_pins, &mv_mode);
+                    dir[0] = (uint8_t)(occ & 0xFF);
+                    dir[1] = (uint8_t)(occ >> 8);
+                    dir[2] = m;
+                    dir[3] = d;
+                    dir[4] = la;
+                    dir[5] = inc_pins;
+                    dir[6] = mv_mode;
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req,
                                             dir, sizeof(dir));
                 }
                 case REQ_PRESET_GET_ACTIVE: {
-                    static uint8_t v = 0;
+                    static uint8_t v;
+                    v = preset_get_active();
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 1);
                 }
                 case REQ_PRESET_GET_STARTUP: {
-                    static uint8_t v[3] = { 0, 0, 0 };
+                    /* 3 bytes: startup_mode, default_slot, include_pins. */
+                    static uint8_t v[3];
+                    uint16_t occ; uint8_t la, mv_mode;
+                    preset_get_directory(&occ, &v[0], &v[1], &la, &v[2], &mv_mode);
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req,
                                             v, sizeof(v));
                 }
                 case REQ_PRESET_GET_INCLUDE_PINS: {
-                    static uint8_t v = 0;
+                    static uint8_t v;
+                    uint16_t occ; uint8_t m, d, la, mv_mode;
+                    preset_get_directory(&occ, &m, &d, &la, &v, &mv_mode);
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 1);
                 }
                 case REQ_PRESET_GET_NAME: {
-                    /* All slots empty — return zero-filled name. */
-                    static char nm[32] = { 0 };
+                    /* wValue = slot index (0..9). Returns 32-byte name. */
+                    static char nm[PRESET_NAME_LEN];
+                    uint8_t slot = req->wValue & 0xFF;
+                    if (preset_get_name(slot, nm) != 0) {
+                        memset(nm, 0, sizeof(nm));
+                    }
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req,
                                             nm, sizeof(nm));
+                }
+
+                /* Console wraps SAVE / LOAD / DELETE as GETs that return a
+                 * 1-byte status (PRESET_OK or PRESET_ERR_*). The device
+                 * performs the action synchronously and ships the result
+                 * back in the data stage of the same control transfer. */
+                case REQ_PRESET_SAVE: {
+                    extern volatile uint8_t last_preset_result;
+                    static uint8_t status;
+                    status = preset_save(req->wValue & 0xFF);
+                    last_preset_result = status;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &status, 1);
+                }
+                case REQ_PRESET_LOAD: {
+                    extern volatile uint8_t last_preset_result;
+                    static uint8_t status;
+                    status = preset_load(req->wValue & 0xFF);
+                    last_preset_result = status;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &status, 1);
+                }
+                case REQ_PRESET_DELETE: {
+                    extern volatile uint8_t last_preset_result;
+                    static uint8_t status;
+                    status = preset_delete(req->wValue & 0xFF);
+                    last_preset_result = status;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &status, 1);
                 }
 
                 /* ---- Clear clips ---- */
@@ -616,7 +692,28 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
         }
 
         if (req->wLength == 0) {
-            /* Zero-length SET — ack immediately. */
+            /* Zero-length SET — slot/index lives in wValue, no payload.
+             * Dispatch action here (no DATA stage will fire), then ack. */
+            extern volatile uint8_t last_preset_result;
+            uint8_t slot = req->wValue & 0xFF;
+            switch (req->bRequest) {
+                case REQ_PRESET_SAVE:
+                    last_preset_result = preset_save(slot);
+                    break;
+                case REQ_PRESET_LOAD:
+                    last_preset_result = preset_load(slot);
+                    break;
+                case REQ_PRESET_DELETE:
+                    last_preset_result = preset_delete(slot);
+                    break;
+                case REQ_PRESET_SET_STARTUP: {
+                    uint8_t mode = (req->wValue >> 8) & 0xFF;
+                    uint8_t dflt =  req->wValue       & 0xFF;
+                    last_preset_result = preset_set_startup(mode, dflt);
+                    break;
+                }
+                default: break;
+            }
             return tud_control_status(rhport, (tusb_control_request_t *)req);
         }
 
@@ -1074,16 +1171,53 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 break;
             }
 
-            /* ---- Preset SETs are silent no-ops in M7d (no flash storage)
-             * — Console UI will think the save succeeded but nothing
-             * persists. M11 wires real preset storage on the W25Q64. */
-            case REQ_PRESET_SAVE:
-            case REQ_PRESET_LOAD:
-            case REQ_PRESET_DELETE:
-            case REQ_PRESET_SET_NAME:
-            case REQ_PRESET_SET_STARTUP:
-            case REQ_PRESET_SET_INCLUDE_PINS:
+            /* ---- Preset SETs (M11) — backed by W25Q64 + flash_storage.c.
+             * The slot index is wValue (0..9). preset_save / load take
+             * zero-byte payloads; the rest carry their data in vendor_rx_buf. */
+            case REQ_PRESET_SAVE: {
+                uint8_t slot = vendor_last_wValue & 0xFF;
+                extern volatile uint8_t last_preset_result;
+                last_preset_result = preset_save(slot);
                 break;
+            }
+            case REQ_PRESET_LOAD: {
+                uint8_t slot = vendor_last_wValue & 0xFF;
+                preset_load(slot);
+                /* preset_load runs filter recompute + delay update inside
+                 * itself; matches the bulk-SET drain in the main loop. */
+                break;
+            }
+            case REQ_PRESET_DELETE: {
+                uint8_t slot = vendor_last_wValue & 0xFF;
+                preset_delete(slot);
+                break;
+            }
+            case REQ_PRESET_SET_NAME: {
+                uint8_t slot = vendor_last_wValue & 0xFF;
+                if (vendor_last_wLength > 0 && vendor_last_wLength < 64) {
+                    char name[PRESET_NAME_LEN];
+                    size_t n = vendor_last_wLength < (PRESET_NAME_LEN - 1)
+                             ? vendor_last_wLength : (PRESET_NAME_LEN - 1);
+                    memset(name, 0, sizeof(name));
+                    memcpy(name, vendor_rx_buf, n);
+                    preset_set_name(slot, name);
+                }
+                break;
+            }
+            case REQ_PRESET_SET_STARTUP: {
+                /* wValue HI = mode (0=specified, 1=last_active),
+                 * wValue LO = default slot index (used only when mode=0). */
+                uint8_t mode = (vendor_last_wValue >> 8) & 0xFF;
+                uint8_t dflt =  vendor_last_wValue       & 0xFF;
+                preset_set_startup(mode, dflt);
+                break;
+            }
+            case REQ_PRESET_SET_INCLUDE_PINS: {
+                if (vendor_last_wLength >= 1) {
+                    preset_set_include_pins(vendor_rx_buf[0] != 0);
+                }
+                break;
+            }
 
             default:
                 /* Other SETs land here once their handlers arrive. */

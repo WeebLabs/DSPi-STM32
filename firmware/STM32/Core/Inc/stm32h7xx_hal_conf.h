@@ -20,6 +20,13 @@ extern "C" {
 #define HAL_SPI_MODULE_ENABLED          /* M11: SPI3 -> W25Q64 preset flash */
 #define HAL_CORTEX_MODULE_ENABLED
 #define HAL_DMA_MODULE_ENABLED
+/* HAL_FLASH stays enabled (HAL_RCC_ClockConfig needs FLASH_LATENCY_4 +
+ * __HAL_FLASH_GET_LATENCY). flash_clkdiv.h #undefs FLASH_SECTOR_SIZE /
+ * FLASH_PAGE_SIZE before redefining them — the HAL macros for H7
+ * internal flash are 128 KB / 32 byte, the wrong sizes for the W25Q64
+ * SPI NOR. The undef-then-redefine is contained in flash_clkdiv.h so
+ * runtime code that touches both internal and external flash isn't
+ * silently using the wrong constants. */
 #define HAL_FLASH_MODULE_ENABLED
 #define HAL_GPIO_MODULE_ENABLED
 #define HAL_HSEM_MODULE_ENABLED
