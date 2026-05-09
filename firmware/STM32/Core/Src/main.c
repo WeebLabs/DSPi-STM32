@@ -104,11 +104,24 @@ int main(void) {
      * RAM mirror that flash_storage.c reads from via XIP_BASE, then run
      * preset_boot_load() to apply the user's persisted slot (or factory
      * defaults if nothing saved yet / flash absent). Order matters:
-     * w25q_init -> dspi_flash_init -> preset_boot_load. */
+     * w25q_init -> dspi_flash_init -> preset_boot_load -> recompute.
+     *
+     * preset_boot_load() populates filter_recipes[] / channel_delays_ms /
+     * etc. from the persisted slot but does NOT recompile filters[][] or
+     * the per-output delay-sample counts — that's the runtime
+     * preset_load()'s job, which assumes recompute already happened on
+     * cold boot. We replay it here so the very first audio block hits
+     * the user's saved EQ + delays instead of the flat-filter defaults
+     * dsp_recalculate_all_filters above produced from empty recipes. */
     w25q_present = w25q_init(w25q_jedec_id);
     if (w25q_present) {
         dspi_flash_init();      /* read 48 KB preset region into mirror */
-        preset_boot_load();     /* apply startup slot (or factory) */
+        preset_boot_load();     /* load persisted slot's recipes into globals */
+        dsp_recalculate_all_filters(48000.0f);   /* compile recipes -> filters */
+        loudness_recompute_pending = true;       /* main-loop driver re-keys */
+        crossfeed_update_pending   = true;
+        leveller_update_pending    = true;
+        leveller_reset_pending     = true;
     }
 
     Audio_Init();     /* SAI1_A + DMA1_Stream0 + sine table fill */
