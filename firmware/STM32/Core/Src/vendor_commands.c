@@ -468,13 +468,21 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                      * Mirror the RP convention so Console's
                      * "set_output_type → poll-for-status" flow works.
                      * Status returned is 0 (success) on valid input,
-                     * 0xFF (generic fail) for any rejection. */
+                     * 0xFF (generic fail) for any rejection.
+                     *
+                     * Phase 4: when the type actually changes, raise a
+                     * flag that the main loop drains via Audio_HotSwap.
+                     * The actual SAI tear-down + re-init can't run from
+                     * the USB ISR (HAL_SAI_DeInit touches RCC under
+                     * locks), so the swap happens in main-loop context. */
                     uint8_t slot     =  req->wValue       & 0xFF;
                     uint8_t new_type = (req->wValue >> 8) & 0xFF;
                     static uint8_t status;
                     if (slot < NUM_SPDIF_INSTANCES && new_type <= 1) {
                         if (output_types[slot] != new_type) {
                             output_types[slot] = new_type;
+                            extern volatile bool output_type_change_pending;
+                            output_type_change_pending = true;
                             notify_param_write(
                                 (uint16_t)(offsetof(WireBulkParams,
                                                     i2s_config.output_types)
@@ -1181,8 +1189,11 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
             case REQ_SET_OUTPUT_TYPE: {
                 uint8_t slot     =  vendor_last_wValue       & 0xFF;
                 uint8_t new_type = (vendor_last_wValue >> 8) & 0xFF;
-                if (slot < NUM_SPDIF_INSTANCES && new_type <= 1) {
+                if (slot < NUM_SPDIF_INSTANCES && new_type <= 1
+                    && output_types[slot] != new_type) {
                     output_types[slot] = new_type;
+                    extern volatile bool output_type_change_pending;
+                    output_type_change_pending = true;
                     notify_param_write(
                         (uint16_t)(offsetof(WireBulkParams, i2s_config.output_types)
                                    + slot),

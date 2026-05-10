@@ -35,7 +35,10 @@
 #include "crossfeed.h"     /* M7d: BS2B crossfeed */
 #include "leveller.h"      /* M7d: volume leveller */
 #include "loudness.h"      /* M7i: loudness compensation */
+#include "notify.h"        /* M12 P4: notify_param_write on coerce */
+#include "bulk_params.h"   /* M12 P4: WireBulkParams offsetof for notify */
 #include <math.h>          /* M7e: fabsf for level meters */
+#include <stddef.h>        /* offsetof */
 
 /* ---- Per-sub-block DMA rings in AXI SRAM (DMA1 cannot reach DTCM) ----
  *
@@ -622,6 +625,328 @@ static void bdma_init_common(DMA_HandleTypeDef *h, BDMA_Channel_TypeDef *ch,
 }
 
 /* ---------------------------------------------------------------------- */
+/* output_types[] dependency rules                                        */
+/* ---------------------------------------------------------------------- */
+/* Hardware constraints baked into our pin layout on the WeAct H723VGT6:
+ *
+ *   PE2 = SAI1_MCLK_A   (the only MCLK pin AF-muxed)
+ *   PE5 = SAI1_SCK_A    (the only BCK pin AF-muxed)
+ *   PE4 = SAI1_FS_A     (the only LRCLK pin AF-muxed)
+ *   PE6 = SAI1_SD_A     slot 0
+ *   PE3 = SAI1_SD_B     slot 1
+ *   PD11 = SAI4_SD_A    slot 2
+ *   PA0  = SAI4_SD_B    slot 3
+ *
+ * The shared MCLK/BCK/LRCLK pins are SAI1_A's. Any slot configured for
+ * I2S needs those clocks present on PE5/PE4 (and optionally PE2). They
+ * are present iff SAI1_A is itself in I2S mode — in SPDIF mode the
+ * SAI clock generator runs at the biphase rate and the FS/SCK pin
+ * outputs do not carry valid I2S timing.
+ *
+ * Cross-block sync paths (the only way slots 1/2/3 can use SAI1_A's
+ * I2S clocks):
+ *   slot 1 → SAI1_B, can only sync-internal to SAI1_A within the SAI1
+ *            peripheral. No AF-muxed clock pins of its own.
+ *   slot 2 → SAI4_A, can only sync-external to SAI1 via the cross-
+ *            peripheral mesh. PD12/PD13 (SAI4_FS_A/SCK_A) NOT AF-muxed.
+ *   slot 3 → SAI4_B, can only sync-internal to SAI4_A. No clock pins
+ *            of its own.
+ *
+ * Therefore an I2S slot N requires its "clock parent" to also be I2S:
+ *   slot 1 I2S → slot 0 must be I2S (sync-internal to SAI1_A)
+ *   slot 2 I2S → slot 0 must be I2S (sync-ext to SAI1)
+ *   slot 3 I2S → slot 2 must be I2S (sync-internal to SAI4_A)
+ *
+ * SPDIF slots have no parent dependency: they self-clock from PLL2_P,
+ * embed the recovered clock in the biphase output, and don't share
+ * pins with anything else.
+ *
+ * sanitize_output_types coerces invalid I2S choices DOWN to SPDIF
+ * (cascade-down) so audio_configure_sais always sees a valid set.
+ * Returns a 4-bit mask of slots that were coerced — the caller fires
+ * notify_param_write for each so Console reflects the auto-change. */
+static uint8_t sanitize_output_types(void) {
+    extern uint8_t output_types[];
+    uint8_t coerced = 0;
+    /* slot 1 depends on slot 0; slot 2 depends on slot 0; slot 3
+     * depends on slot 2. Apply rules in dependency order so a single
+     * pass settles. */
+    if (output_types[1] == OUTPUT_TYPE_I2S
+        && output_types[0] == OUTPUT_TYPE_SPDIF) {
+        output_types[1] = OUTPUT_TYPE_SPDIF;
+        coerced |= (1u << 1);
+    }
+    if (output_types[2] == OUTPUT_TYPE_I2S
+        && output_types[0] == OUTPUT_TYPE_SPDIF) {
+        output_types[2] = OUTPUT_TYPE_SPDIF;
+        coerced |= (1u << 2);
+    }
+    /* slot 3's parent is slot 2, which we may have just coerced. */
+    if (output_types[3] == OUTPUT_TYPE_I2S
+        && output_types[2] == OUTPUT_TYPE_SPDIF) {
+        output_types[3] = OUTPUT_TYPE_SPDIF;
+        coerced |= (1u << 3);
+    }
+    return coerced;
+}
+
+/* ---------------------------------------------------------------------- */
+/* SAI sub-block (re)configuration — type-driven                          */
+/* ---------------------------------------------------------------------- */
+/* Extracted from the original Audio_Init body so Phase 4 can call it
+ * twice — once at boot and again whenever a slot's output type changes
+ * at runtime. Honours the current `output_types[]` array and applies
+ * the all-I2S-vs-mixed sync rule from Phase 3. Caller is responsible
+ * for ensuring all four sub-blocks are in HAL_SAI_STATE_RESET (i.e.,
+ * teardown before re-configure). */
+static void audio_configure_sais(void) {
+    extern uint8_t output_types[];
+    bool s0_spdif  = output_types[0] == OUTPUT_TYPE_SPDIF;
+    bool s1_spdif  = output_types[1] == OUTPUT_TYPE_SPDIF;
+    bool s2_spdif  = output_types[2] == OUTPUT_TYPE_SPDIF;
+    bool s3_spdif  = output_types[3] == OUTPUT_TYPE_SPDIF;
+    /* Per-slot sync rule (post-sanitize): an I2S child syncs to its
+     * I2S parent. SPDIF slots are always their own master.
+     *   slot 1 I2S → sync-internal to SAI1_A
+     *   slot 2 I2S → sync-ext to SAI1
+     *   slot 3 I2S → sync-internal to SAI4_A
+     * sanitize_output_types guarantees that whenever the child is I2S,
+     * the parent is also I2S, so these always make sense. */
+    bool s1_sync_to_a1 = !s1_spdif;
+    bool s2_sync_to_s1 = !s2_spdif;
+    bool s3_sync_to_a4 = !s3_spdif;
+    /* SAI1_A broadcasts on the cross-peripheral mesh whenever slot 0
+     * is I2S — that's the path SAI4_A subscribes to when slot 2 is
+     * also I2S. Always-on when slot 0 is I2S is harmless and saves
+     * the configure logic from caring about subscribers. */
+    bool a1_broadcast = !s0_spdif;
+
+    /* Common shape for every sub-block — fields that don't depend on
+     * type or sync role. Per-block init starts with this and then
+     * overrides Instance / Protocol / Mode / Sync / NoDivider. */
+    SAI_HandleTypeDef hsai_template = { 0 };
+    hsai_template.Init.AudioMode       = SAI_MODEMASTER_TX;
+    hsai_template.Init.Synchro         = SAI_ASYNCHRONOUS;
+    hsai_template.Init.OutputDrive     = SAI_OUTPUTDRIVE_DISABLE;
+    hsai_template.Init.NoDivider       = SAI_MASTERDIVIDER_ENABLE;
+    hsai_template.Init.FIFOThreshold   = SAI_FIFOTHRESHOLD_HF;
+    hsai_template.Init.AudioFrequency  = SAI_AUDIO_FREQUENCY_48K;
+    hsai_template.Init.SynchroExt      = SAI_SYNCEXT_DISABLE;
+    hsai_template.Init.MonoStereoMode  = SAI_STEREOMODE;
+    hsai_template.Init.CompandingMode  = SAI_NOCOMPANDING;
+    hsai_template.Init.TriState        = SAI_OUTPUT_NOTRELEASED;
+    hsai_template.Init.Mckdiv          = 0;
+    hsai_template.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
+    hsai_template.Init.MckOutput       = SAI_MCK_OUTPUT_ENABLE;
+
+    /* I2S: HAL_SAI_InitProtocol fills in FrameInit/SlotInit from the
+     * I2S Philips standard with the requested DataSize and slot count.
+     * SPDIF: HAL_SAI_InitProtocol(SAI_SPDIF_PROTOCOL) is **not**
+     * implemented — its switch returns HAL_ERROR for SPDIF. We set
+     * the SPDIF-specific fields directly on the handle and call
+     * HAL_SAI_Init, which is the level that actually programs CR1/
+     * CR2/FRCR/SLOTR. Field values match RM0468 §41.6.5. */
+    #define INIT_BLOCK_PROTO(handle, is_spdif)                                  \
+        do {                                                                    \
+            if (is_spdif) {                                                     \
+                (handle).Init.Protocol     = SAI_SPDIF_PROTOCOL;                \
+                (handle).Init.DataSize     = SAI_DATASIZE_24;                   \
+                (handle).Init.FirstBit     = SAI_FIRSTBIT_MSB;                  \
+                (handle).Init.ClockStrobing= SAI_CLOCKSTROBING_FALLINGEDGE;     \
+                (handle).FrameInit.FrameLength       = 64U;                     \
+                (handle).FrameInit.ActiveFrameLength = 32U;                     \
+                (handle).FrameInit.FSDefinition      = SAI_FS_CHANNEL_IDENTIFICATION; \
+                (handle).FrameInit.FSPolarity        = SAI_FS_ACTIVE_LOW;       \
+                (handle).FrameInit.FSOffset          = SAI_FS_BEFOREFIRSTBIT;   \
+                (handle).SlotInit.FirstBitOffset = 0;                           \
+                (handle).SlotInit.SlotSize       = SAI_SLOTSIZE_32B;            \
+                (handle).SlotInit.SlotNumber     = 2;                           \
+                (handle).SlotInit.SlotActive     = SAI_SLOTACTIVE_ALL;          \
+                if (HAL_SAI_Init(&(handle)) != HAL_OK) Error_Handler();         \
+            } else {                                                            \
+                if (HAL_SAI_InitProtocol(&(handle), SAI_I2S_STANDARD,           \
+                                         SAI_PROTOCOL_DATASIZE_24BIT,           \
+                                         2) != HAL_OK) Error_Handler();         \
+            }                                                                   \
+        } while (0)
+
+    /* SAI1 Block A — slot 0. Always master TX. */
+    hsai_BlockA1                       = hsai_template;
+    hsai_BlockA1.Instance              = SAI1_Block_A;
+    hsai_BlockA1.Init.SynchroExt       = a1_broadcast ? SAI_SYNCEXT_OUTBLOCKA_ENABLE
+                                                      : SAI_SYNCEXT_DISABLE;
+    hsai_BlockA1.Init.NoDivider        = s0_spdif ? SAI_MASTERDIVIDER_DISABLE
+                                                  : SAI_MASTERDIVIDER_ENABLE;
+    INIT_BLOCK_PROTO(hsai_BlockA1, s0_spdif);
+    __HAL_LINKDMA(&hsai_BlockA1, hdmatx, hdma_sai1_a);
+
+    /* SAI1 Block B — slot 1. I2S → sync-internal slave to SAI1_A
+     * (zero phase offset to slot 0). SPDIF → own master. */
+    hsai_BlockB1                       = hsai_template;
+    hsai_BlockB1.Instance              = SAI1_Block_B;
+    if (s1_sync_to_a1) {
+        hsai_BlockB1.Init.AudioMode    = SAI_MODESLAVE_TX;
+        hsai_BlockB1.Init.Synchro      = SAI_SYNCHRONOUS;
+        hsai_BlockB1.Init.MckOutput    = SAI_MCK_OUTPUT_DISABLE;
+    }
+    hsai_BlockB1.Init.NoDivider        = s1_spdif ? SAI_MASTERDIVIDER_DISABLE
+                                                  : SAI_MASTERDIVIDER_ENABLE;
+    INIT_BLOCK_PROTO(hsai_BlockB1, s1_spdif);
+    __HAL_LINKDMA(&hsai_BlockB1, hdmatx, hdma_sai1_b);
+
+    /* SAI4 Block A — slot 2. I2S → sync-external slave to SAI1's
+     * broadcast (cross-peripheral mesh). SPDIF → own master. */
+    hsai_BlockA4                       = hsai_template;
+    hsai_BlockA4.Instance              = SAI4_Block_A;
+    if (s2_sync_to_s1) {
+        hsai_BlockA4.Init.AudioMode    = SAI_MODESLAVE_TX;
+        hsai_BlockA4.Init.Synchro      = SAI_SYNCHRONOUS_EXT_SAI1;
+        hsai_BlockA4.Init.MckOutput    = SAI_MCK_OUTPUT_DISABLE;
+    }
+    hsai_BlockA4.Init.NoDivider        = s2_spdif ? SAI_MASTERDIVIDER_DISABLE
+                                                  : SAI_MASTERDIVIDER_ENABLE;
+    INIT_BLOCK_PROTO(hsai_BlockA4, s2_spdif);
+    __HAL_LINKDMA(&hsai_BlockA4, hdmatx, hdma_sai4_a);
+
+    /* SAI4 Block B — slot 3. I2S → sync-internal slave to SAI4_A.
+     * SPDIF → own master. */
+    hsai_BlockB4                       = hsai_template;
+    hsai_BlockB4.Instance              = SAI4_Block_B;
+    if (s3_sync_to_a4) {
+        hsai_BlockB4.Init.AudioMode    = SAI_MODESLAVE_TX;
+        hsai_BlockB4.Init.Synchro      = SAI_SYNCHRONOUS;
+        hsai_BlockB4.Init.MckOutput    = SAI_MCK_OUTPUT_DISABLE;
+    }
+    hsai_BlockB4.Init.NoDivider        = s3_spdif ? SAI_MASTERDIVIDER_DISABLE
+                                                  : SAI_MASTERDIVIDER_ENABLE;
+    INIT_BLOCK_PROTO(hsai_BlockB4, s3_spdif);
+    __HAL_LINKDMA(&hsai_BlockB4, hdmatx, hdma_sai4_b);
+
+    #undef INIT_BLOCK_PROTO
+}
+
+/* During a hot-swap the SAI peripherals briefly disable their SD pin
+ * outputs (when SAIEN goes 0 the pin returns to its AF default state,
+ * effectively high-Z). Meanwhile SAI1_A's BCK/LRCLK on PE5/PE4 keep
+ * ticking until that block itself is torn down — and any DAC wired
+ * to PE3/PE6/PD11/PA0 happily samples whatever floating voltage or
+ * EMI noise is on its SD pin during that window, which presents as
+ * a sharp loud burst at re-enable.
+ *
+ * Defence: temporarily switch each SD pin from its alternate-function
+ * role to plain GPIO output driving LOW for the duration of the swap.
+ * The DAC samples a steady 0 (digital silence) instead of garbage.
+ * After audio_configure_sais finishes, the pins go back to their AF
+ * role (different AF per pin per board layout) and the SAI takes
+ * over driving them again. */
+static void mute_sd_pins_to_gpio_low(void) {
+    GPIO_InitTypeDef g = {
+        .Mode  = GPIO_MODE_OUTPUT_PP,
+        .Pull  = GPIO_NOPULL,
+        .Speed = GPIO_SPEED_FREQ_LOW,
+    };
+    /* Drive the pins low FIRST, then switch mode — order matters so
+     * the pin doesn't glitch high-Z → high → low. */
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_6, GPIO_PIN_RESET);  /* slot 0 */
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);  /* slot 1 */
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_11, GPIO_PIN_RESET); /* slot 2 */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0,  GPIO_PIN_RESET); /* slot 3 */
+    g.Pin = GPIO_PIN_6;  HAL_GPIO_Init(GPIOE, &g);
+    g.Pin = GPIO_PIN_3;  HAL_GPIO_Init(GPIOE, &g);
+    g.Pin = GPIO_PIN_11; HAL_GPIO_Init(GPIOD, &g);
+    g.Pin = GPIO_PIN_0;  HAL_GPIO_Init(GPIOA, &g);
+}
+
+static void unmute_sd_pins_to_af(void) {
+    GPIO_InitTypeDef g = {
+        .Mode  = GPIO_MODE_AF_PP,
+        .Pull  = GPIO_NOPULL,
+        .Speed = GPIO_SPEED_FREQ_VERY_HIGH,
+    };
+    /* PE6 = SAI1_SD_A (AF6) — slot 0 */
+    g.Pin = GPIO_PIN_6;  g.Alternate = GPIO_AF6_SAI1;
+    HAL_GPIO_Init(GPIOE, &g);
+    /* PE3 = SAI1_SD_B (AF6) — slot 1 */
+    g.Pin = GPIO_PIN_3;  g.Alternate = GPIO_AF6_SAI1;
+    HAL_GPIO_Init(GPIOE, &g);
+    /* PD11 = SAI4_SD_A (AF10) — slot 2 */
+    g.Pin = GPIO_PIN_11; g.Alternate = GPIO_AF10_SAI4;
+    HAL_GPIO_Init(GPIOD, &g);
+    /* PA0 = SAI4_SD_B (AF10) — slot 3 */
+    g.Pin = GPIO_PIN_0;  g.Alternate = GPIO_AF10_SAI4;
+    HAL_GPIO_Init(GPIOA, &g);
+}
+
+/* Flush the SAI FIFO on every sub-block. HAL_SAI_DeInit does NOT clear
+ * the FIFO — it's hardware state outside HAL's tracking — and HAL_SAI_
+ * Init doesn't flush it either. Without this, the first ~4 samples
+ * shifted out after SAIEN goes back high are whatever was left in the
+ * FIFO when teardown ran (typically loud since they predate the
+ * pre-fill-with-zeros). FFLUSH is self-clearing per RM0468. */
+static void flush_all_sai_fifos(void) {
+    SAI1_Block_A->CR2 |= SAI_xCR2_FFLUSH;
+    SAI1_Block_B->CR2 |= SAI_xCR2_FFLUSH;
+    SAI4_Block_A->CR2 |= SAI_xCR2_FFLUSH;
+    SAI4_Block_B->CR2 |= SAI_xCR2_FFLUSH;
+}
+
+/* Tear down all four SAI sub-blocks back to RESET state in preparation
+ * for a hot-swap. After this returns, no SAI is clocking anything and
+ * all four DMAs are halted.
+ *
+ * Why we bypass HAL_SAI_DMAStop: that function calls SAI_Disable which
+ * polls SAI_xCR1.SAIEN for clear with SAI_LONG_TIMEOUT (1 second).
+ * SAIEN clear is only effective at end-of-frame — for sync-slave
+ * sub-blocks, that requires the master to keep clocking. After ANY
+ * mixed-mode hot-swap, the sub-block dependency graph can change
+ * such that a previously-quiet sub-block is now waiting on a clock
+ * that's about to be torn down, and HAL_SAI_DMAStop hangs for the
+ * full second. The next hot-swap then finds inconsistent HAL state
+ * and HAL_SAI_Init returns HAL_ERROR → Error_Handler() infinite
+ * loop, indistinguishable from a hardware crash.
+ *
+ * The reliable approach: clear SAIEN + DMAEN on every block in close
+ * succession (so all blocks lose their clock requirement at roughly
+ * the same time), wait one frame period (~21 µs at 48 kHz) so any
+ * in-flight frame completes, then HAL_DMA_Abort the DMA streams and
+ * HAL_SAI_DeInit the SAI handles. HAL_SAI_DeInit's internal call to
+ * SAI_Disable then sees SAIEN already 0 and returns immediately. */
+static void audio_teardown_sais(void) {
+    /* Step 1: simultaneously clear SAIEN + DMAEN on every sub-block.
+     * Direct register writes — no polling. The SAI hardware will
+     * actually deassert at its next end-of-frame regardless of
+     * whether HAL is watching. */
+    SAI1_Block_A->CR1 &= ~(SAI_xCR1_SAIEN | SAI_xCR1_DMAEN);
+    SAI1_Block_B->CR1 &= ~(SAI_xCR1_SAIEN | SAI_xCR1_DMAEN);
+    SAI4_Block_A->CR1 &= ~(SAI_xCR1_SAIEN | SAI_xCR1_DMAEN);
+    SAI4_Block_B->CR1 &= ~(SAI_xCR1_SAIEN | SAI_xCR1_DMAEN);
+    __DSB();
+
+    /* Step 2: wait a few frame periods so any in-flight frame ends
+     * and the hardware actually deasserts SAIEN. One frame at 48 kHz
+     * = 20.83 µs; 100 frames = 2 ms is conservative and unnoticed. */
+    HAL_Delay(2);
+
+    /* Step 3: abort each DMA stream/channel directly. HAL_DMA_Abort
+     * disables the EN bit, polls for it to clear, and resets the
+     * handle's State to READY — should be quick since we already
+     * stopped the SAI from requesting transfers. */
+    HAL_DMA_Abort(&hdma_sai1_a);
+    HAL_DMA_Abort(&hdma_sai1_b);
+    HAL_DMA_Abort(&hdma_sai4_a);
+    HAL_DMA_Abort(&hdma_sai4_b);
+
+    /* Step 4: HAL_SAI_DeInit each handle. Its internal SAI_Disable
+     * sees SAIEN already cleared and returns without polling.
+     * State is set to RESET so the next HAL_SAI_Init treats this as
+     * a fresh init. */
+    HAL_SAI_DeInit(&hsai_BlockB4);
+    HAL_SAI_DeInit(&hsai_BlockA4);
+    HAL_SAI_DeInit(&hsai_BlockB1);
+    HAL_SAI_DeInit(&hsai_BlockA1);
+}
+
+/* ---------------------------------------------------------------------- */
 /* Public init                                                            */
 /* ---------------------------------------------------------------------- */
 void Audio_Init(void) {
@@ -693,155 +1018,13 @@ void Audio_Init(void) {
     HAL_NVIC_SetPriority(BDMA_Channel1_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(BDMA_Channel1_IRQn);
 
-    /* M12 phase 3: per-slot output type drives protocol + sync model.
-     *
-     * `output_types[slot]` (0=SPDIF, 1=I2S) tells us what each of the
-     * four sub-blocks should emit. The Phase 2 cross-peripheral sync
-     * chain (SAI1_A master broadcasting → SAI4 slave-ext) only makes
-     * sense when ALL four slots are I2S — its whole purpose is sample-
-     * aligning the four 24-bit-PCM streams to a common BCK/FS. As
-     * soon as any slot becomes SPDIF (different bit clock, biphase-
-     * coded, frame timing managed by hardware), that slot needs its
-     * own independent master clock generator. To keep the rules
-     * simple and predictable, the entire sync chain switches off as a
-     * unit: all-I2S → Phase 2 sync chain (perfect alignment); any
-     * mix → every sub-block its own master (frequency-locked via the
-     * shared PLL2_P kernel clock, ≤ ~0.5 sample static phase offset
-     * between SAI1 and SAI4 — no drift, but not bit-aligned).
-     *
-     * Type changes require a reboot — Phase 4 will lift that.
-     * Slot-pair grouping is a hard property of the silicon: SAI1 = slots
-     * 0+1, SAI4 = slots 2+3; sub-block B can only sync-internal to A
-     * within the SAME peripheral. */
-    extern uint8_t output_types[];
-    bool s0_spdif  = output_types[0] == OUTPUT_TYPE_SPDIF;
-    bool s1_spdif  = output_types[1] == OUTPUT_TYPE_SPDIF;
-    bool s2_spdif  = output_types[2] == OUTPUT_TYPE_SPDIF;
-    bool s3_spdif  = output_types[3] == OUTPUT_TYPE_SPDIF;
-    bool all_i2s   = !s0_spdif && !s1_spdif && !s2_spdif && !s3_spdif;
-
-    /* Common shape for every sub-block — fields that don't depend on
-     * type or sync role. Per-block init starts with this and then
-     * overrides Instance / Protocol / Mode / Sync / NoDivider. */
-    SAI_HandleTypeDef hsai_template = { 0 };
-    hsai_template.Init.AudioMode       = SAI_MODEMASTER_TX;
-    hsai_template.Init.Synchro         = SAI_ASYNCHRONOUS;
-    hsai_template.Init.OutputDrive     = SAI_OUTPUTDRIVE_DISABLE;
-    hsai_template.Init.NoDivider       = SAI_MASTERDIVIDER_ENABLE;
-    hsai_template.Init.FIFOThreshold   = SAI_FIFOTHRESHOLD_HF;
-    hsai_template.Init.AudioFrequency  = SAI_AUDIO_FREQUENCY_48K;
-    hsai_template.Init.SynchroExt      = SAI_SYNCEXT_DISABLE;
-    hsai_template.Init.MonoStereoMode  = SAI_STEREOMODE;
-    hsai_template.Init.CompandingMode  = SAI_NOCOMPANDING;
-    hsai_template.Init.TriState        = SAI_OUTPUT_NOTRELEASED;
-    hsai_template.Init.Mckdiv          = 0;
-    hsai_template.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
-    hsai_template.Init.MckOutput       = SAI_MCK_OUTPUT_ENABLE;
-
-    /* Helper macro to initialise one sub-block.
-     *
-     * I2S: HAL_SAI_InitProtocol fills in FrameInit/SlotInit from the
-     * I2S Philips standard with the requested DataSize and slot count.
-     *
-     * SPDIF: HAL_SAI_InitProtocol(SAI_SPDIF_PROTOCOL) is **not
-     * implemented** in stm32h7xx_hal_sai.c — its switch returns
-     * HAL_ERROR for SPDIF, which means going through InitProtocol
-     * lands in Error_Handler and locks the boot. So we set the SPDIF-
-     * specific fields directly on the handle and call HAL_SAI_Init,
-     * which is the level that actually programs CR1/CR2/FRCR/SLOTR
-     * from whatever's in the struct. Field values match RM0468 §41.6.5
-     * "SPDIF audio mode" — frame length 64, FS = channel ID, slot 32
-     * bit, both slots active, MSB first. */
-    #define INIT_BLOCK_PROTO(handle, is_spdif)                                  \
-        do {                                                                    \
-            if (is_spdif) {                                                     \
-                (handle).Init.Protocol     = SAI_SPDIF_PROTOCOL;                \
-                (handle).Init.DataSize     = SAI_DATASIZE_24;                   \
-                (handle).Init.FirstBit     = SAI_FIRSTBIT_MSB;                  \
-                (handle).Init.ClockStrobing= SAI_CLOCKSTROBING_FALLINGEDGE;     \
-                (handle).FrameInit.FrameLength       = 64U;                     \
-                (handle).FrameInit.ActiveFrameLength = 32U;                     \
-                (handle).FrameInit.FSDefinition      = SAI_FS_CHANNEL_IDENTIFICATION; \
-                (handle).FrameInit.FSPolarity        = SAI_FS_ACTIVE_LOW;       \
-                (handle).FrameInit.FSOffset          = SAI_FS_BEFOREFIRSTBIT;   \
-                (handle).SlotInit.FirstBitOffset = 0;                           \
-                (handle).SlotInit.SlotSize       = SAI_SLOTSIZE_32B;            \
-                (handle).SlotInit.SlotNumber     = 2;                           \
-                (handle).SlotInit.SlotActive     = SAI_SLOTACTIVE_ALL;          \
-                if (HAL_SAI_Init(&(handle)) != HAL_OK) Error_Handler();         \
-            } else {                                                            \
-                if (HAL_SAI_InitProtocol(&(handle), SAI_I2S_STANDARD,           \
-                                         SAI_PROTOCOL_DATASIZE_24BIT,           \
-                                         2) != HAL_OK) Error_Handler();         \
-            }                                                                   \
-        } while (0)
-
-    /* SAI1 Block A — slot 0. Always master TX. SyncExt broadcast is on
-     * iff all four slots are I2S (i.e., the cross-peripheral sync chain
-     * is in use). NoDivider depends on protocol: HAL's SPDIF path lives
-     * in the NODIV=1 branch (hardware fixes frame length to 64 and
-     * halves Mckdiv to give 2× symbol-rate bit clock); I2S uses the
-     * MCKDIV path with 256× MCLK. */
-    hsai_BlockA1                       = hsai_template;
-    hsai_BlockA1.Instance              = SAI1_Block_A;
-    hsai_BlockA1.Init.SynchroExt       = all_i2s ? SAI_SYNCEXT_OUTBLOCKA_ENABLE
-                                                  : SAI_SYNCEXT_DISABLE;
-    hsai_BlockA1.Init.NoDivider        = s0_spdif ? SAI_MASTERDIVIDER_DISABLE
-                                                  : SAI_MASTERDIVIDER_ENABLE;
-    INIT_BLOCK_PROTO(hsai_BlockA1, s0_spdif);
-    __HAL_LINKDMA(&hsai_BlockA1, hdmatx, hdma_sai1_a);
-
-    /* SAI1 Block B — slot 1. In all-I2S mode, B is sync-internal slave
-     * to A so PE3 stays bit-perfect to PE6 (zero offset). Otherwise B
-     * is its own master — runs from PLL2_P just like A, frequency-
-     * locked but with arbitrary static phase. SLAVE_TX (not MASTER_TX
-     * + SYNCHRONOUS — see the M5 lesson: master+sync scrambles slot
-     * timing). MckOutput=DISABLE in slave mode (no MCLK on PE3 anyway). */
-    hsai_BlockB1                       = hsai_template;
-    hsai_BlockB1.Instance              = SAI1_Block_B;
-    if (all_i2s) {
-        hsai_BlockB1.Init.AudioMode    = SAI_MODESLAVE_TX;
-        hsai_BlockB1.Init.Synchro      = SAI_SYNCHRONOUS;
-        hsai_BlockB1.Init.MckOutput    = SAI_MCK_OUTPUT_DISABLE;
-    }
-    hsai_BlockB1.Init.NoDivider        = s1_spdif ? SAI_MASTERDIVIDER_DISABLE
-                                                  : SAI_MASTERDIVIDER_ENABLE;
-    INIT_BLOCK_PROTO(hsai_BlockB1, s1_spdif);
-    __HAL_LINKDMA(&hsai_BlockB1, hdmatx, hdma_sai1_b);
-
-    /* SAI4 Block A — slot 2. In all-I2S mode, slave-ext to SAI1 via
-     * the cross-peripheral sync mesh (HAL writes SAI4->GCR.SYNCIN=00
-     * + SAI4_A->CR1.SYNCEN=0b10). Otherwise own master from PLL2_P.
-     * MUST be a fresh SAI_HandleTypeDef each branch — HAL inspects
-     * State, ErrorCode, Lock to decide whether to re-MspInit, so
-     * starting from `hsai_template` (zeroed) is safest. */
-    hsai_BlockA4                       = hsai_template;
-    hsai_BlockA4.Instance              = SAI4_Block_A;
-    if (all_i2s) {
-        hsai_BlockA4.Init.AudioMode    = SAI_MODESLAVE_TX;
-        hsai_BlockA4.Init.Synchro      = SAI_SYNCHRONOUS_EXT_SAI1;
-        hsai_BlockA4.Init.MckOutput    = SAI_MCK_OUTPUT_DISABLE;
-    }
-    hsai_BlockA4.Init.NoDivider        = s2_spdif ? SAI_MASTERDIVIDER_DISABLE
-                                                  : SAI_MASTERDIVIDER_ENABLE;
-    INIT_BLOCK_PROTO(hsai_BlockA4, s2_spdif);
-    __HAL_LINKDMA(&hsai_BlockA4, hdmatx, hdma_sai4_a);
-
-    /* SAI4 Block B — slot 3. Same pattern as SAI1_B (sync-internal to
-     * its A in all-I2S mode, own master otherwise). */
-    hsai_BlockB4                       = hsai_template;
-    hsai_BlockB4.Instance              = SAI4_Block_B;
-    if (all_i2s) {
-        hsai_BlockB4.Init.AudioMode    = SAI_MODESLAVE_TX;
-        hsai_BlockB4.Init.Synchro      = SAI_SYNCHRONOUS;
-        hsai_BlockB4.Init.MckOutput    = SAI_MCK_OUTPUT_DISABLE;
-    }
-    hsai_BlockB4.Init.NoDivider        = s3_spdif ? SAI_MASTERDIVIDER_DISABLE
-                                                  : SAI_MASTERDIVIDER_ENABLE;
-    INIT_BLOCK_PROTO(hsai_BlockB4, s3_spdif);
-    __HAL_LINKDMA(&hsai_BlockB4, hdmatx, hdma_sai4_b);
-
-    #undef INIT_BLOCK_PROTO
+    /* M12 phase 3 / 4: per-slot output type drives protocol + sync model.
+     * `output_types[slot]` (0=SPDIF, 1=I2S) tells each of the four sub-
+     * blocks what to emit. The all-I2S → cross-peripheral sync chain
+     * vs any-SPDIF → all-independent-masters rule lives entirely inside
+     * audio_configure_sais; same helper is called at boot here AND from
+     * Audio_HotSwap when a runtime type change comes in (Phase 4). */
+    audio_configure_sais();
 
     /* Pre-fill ALL FOUR buffers with silence so the first BCK edges
      * after Audio_Start ship zero samples until USB starts delivering. */
@@ -917,4 +1100,88 @@ void Audio_Start(void) {
     if (HAL_SAI_Transmit_DMA(&hsai_BlockA1,
                              (uint8_t *)audio_buf_a,
                              AUDIO_WORDS_TOTAL) != HAL_OK) Error_Handler();
+}
+
+/* M12 phase 4: live runtime I2S↔SPDIF type swap.
+ *
+ * REQ_SET_OUTPUT_TYPE writes the new value into output_types[] from
+ * the USB ISR and raises this flag; the main loop drains it and calls
+ * Audio_HotSwap. The swap itself can't run in ISR context — HAL_SAI_*
+ * functions take locks and HAL_SAI_DeInit calls back into MspDeInit
+ * which touches RCC; both are unsafe to do under preemption.
+ *
+ * Volatile boolean rather than per-slot mask: the configure step
+ * always reads ALL of output_types[] anyway (the all-I2S-vs-mixed
+ * sync rule is global), so single-bit fan-out doesn't help. Lost
+ * raise events between two close SETs aren't a problem either —
+ * the second SET re-raises the flag, and the main loop reads
+ * output_types fresh at swap time. */
+volatile bool output_type_change_pending = false;
+
+void Audio_HotSwap(void) {
+    /* Defensive sanitize: cascade-coerce any I2S slot whose clock
+     * parent is SPDIF down to SPDIF, so audio_configure_sais sees
+     * only valid combinations. Coerced changes still get notified
+     * to Console below — important when the user (or a bulk SET)
+     * tries to set an invalid mix; Console UI updates to reflect
+     * the actual applied state instead of silently disagreeing. */
+    uint8_t coerced = sanitize_output_types();
+    if (coerced) {
+        extern uint8_t output_types[];
+        for (int s = 0; s < NUM_SPDIF_INSTANCES; ++s) {
+            if (coerced & (1u << s)) {
+                uint8_t v = output_types[s];
+                notify_param_write(
+                    (uint16_t)(offsetof(WireBulkParams,
+                                        i2s_config.output_types) + s),
+                    1, &v);
+            }
+        }
+    }
+
+    /* fill_half writes into the four DMA buffers from SAI1's IRQ.
+     * Disable that IRQ for the duration of teardown so we don't get
+     * a DMA half-cplt firing into a half-deinitialised SAI handle. */
+    HAL_NVIC_DisableIRQ(DMA1_Stream0_IRQn);
+    HAL_NVIC_DisableIRQ(DMA1_Stream1_IRQn);
+    HAL_NVIC_DisableIRQ(BDMA_Channel0_IRQn);
+    HAL_NVIC_DisableIRQ(BDMA_Channel1_IRQn);
+
+    /* Pin-level mute BEFORE the SAI tears down, so any DAC wired to
+     * an SD line samples a steady 0 instead of a floating pin. */
+    mute_sd_pins_to_gpio_low();
+
+    audio_teardown_sais();
+
+    /* Pre-fill all four DMA rings with silence so the first SAI BCK
+     * after re-Start ships zero samples until fill_half catches up.
+     * Without this we'd play whatever stale data was sitting in the
+     * buffer when teardown halted DMA — typically a glitchy click. */
+    for (uint32_t i = 0; i < AUDIO_WORDS_TOTAL; ++i) {
+        audio_buf_a[i] = 0;
+        audio_buf_b[i] = 0;
+        audio_buf_c[i] = 0;
+        audio_buf_d[i] = 0;
+    }
+
+    audio_configure_sais();
+
+    /* Flush each SAI's FIFO of any stale words left over from before
+     * the teardown — without this the next SAIEN=1 ships those out
+     * first before DMA gets a chance to refill from the zeroed
+     * buffers. */
+    flush_all_sai_fifos();
+
+    /* Hand the SD pins back to the SAI peripherals — the new sub-block
+     * configuration takes over driving them. Re-AF'ing happens BEFORE
+     * Audio_Start so the first sample SAI shifts out is on a properly
+     * AF-muxed pin. */
+    unmute_sd_pins_to_af();
+
+    HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+    HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+    HAL_NVIC_EnableIRQ(BDMA_Channel0_IRQn);
+    HAL_NVIC_EnableIRQ(BDMA_Channel1_IRQn);
+
+    Audio_Start();
 }

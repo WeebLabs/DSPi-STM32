@@ -352,6 +352,15 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         extern uint8_t i2s_mck_pin;
         extern bool    i2s_mck_enabled;
         extern uint16_t i2s_mck_multiplier;
+        /* M12 phase 4: a bulk SET that changes any output type needs
+         * to trigger Audio_HotSwap so the SAIs re-init for the new
+         * I2S/SPDIF mix. Without this, a Console preset load leaves
+         * the SAIs configured for the OLD types until next reboot. */
+        if (memcmp(output_types, in->i2s_config.output_types,
+                   NUM_SPDIF_INSTANCES) != 0) {
+            extern volatile bool output_type_change_pending;
+            output_type_change_pending = true;
+        }
         memcpy(output_types, in->i2s_config.output_types, NUM_SPDIF_INSTANCES);
         i2s_bck_pin = in->i2s_config.bck_pin;
         i2s_mck_pin = in->i2s_config.mck_pin;

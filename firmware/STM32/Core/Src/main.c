@@ -218,6 +218,20 @@ int main(void) {
             audio_set_volume(audio_state.volume);
         }
 
+        /* M12 phase 4: drain runtime output-type changes. The vendor
+         * REQ_SET_OUTPUT_TYPE handler runs in USB ISR context — it
+         * updates output_types[slot] inline (cheap) and raises this
+         * flag (cheaper still). Audio_HotSwap takes ~1 ms (DMA stop +
+         * SAI_DeInit + SAI_Init + DMA restart on four blocks); doing
+         * it here keeps interrupt latency clean and the swap glitch
+         * out of any other latency-sensitive code path. */
+        extern volatile bool output_type_change_pending;
+        if (output_type_change_pending) {
+            output_type_change_pending = false;
+            extern void Audio_HotSwap(void);
+            Audio_HotSwap();
+        }
+
         uint32_t now = HAL_GetTick();
         bool mounted = tud_mounted();
         if (mounted) was_ever_mounted = true;
