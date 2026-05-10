@@ -318,6 +318,20 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 4);
                 }
+                case 0xFA: {  /* DEBUG (M12 P3): per-slot SAI CR1.PRTCFG.
+                               * Returns 4 bytes: byte N = PRTCFG bits[3:2]
+                               * for slot N's SAI sub-block. 0=I2S/free,
+                               * 1=SPDIF. Verify reboot-after-SET actually
+                               * landed in SPDIF mode without a scope. */
+                    static uint8_t buf[4];
+                    buf[0] = (uint8_t)((SAI1_Block_A->CR1 >> 2) & 0x3);
+                    buf[1] = (uint8_t)((SAI1_Block_B->CR1 >> 2) & 0x3);
+                    buf[2] = (uint8_t)((SAI4_Block_A->CR1 >> 2) & 0x3);
+                    buf[3] = (uint8_t)((SAI4_Block_B->CR1 >> 2) & 0x3);
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
                 case 0xFD: {  /* DEBUG (M11): W25Q64 JEDEC ID + presence flag */
                     extern uint8_t w25q_jedec_id[3];
                     extern bool    w25q_present;
@@ -446,6 +460,34 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     v = output_types[slot];
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_SET_OUTPUT_TYPE: {
+                    /* Console sends this as a vendor IN with side effects:
+                     *   wValue = (new_type << 8) | slot_index
+                     *   wLength = 1 (status response)
+                     * Mirror the RP convention so Console's
+                     * "set_output_type → poll-for-status" flow works.
+                     * Status returned is 0 (success) on valid input,
+                     * 0xFF (generic fail) for any rejection. */
+                    uint8_t slot     =  req->wValue       & 0xFF;
+                    uint8_t new_type = (req->wValue >> 8) & 0xFF;
+                    static uint8_t status;
+                    if (slot < NUM_SPDIF_INSTANCES && new_type <= 1) {
+                        if (output_types[slot] != new_type) {
+                            output_types[slot] = new_type;
+                            notify_param_write(
+                                (uint16_t)(offsetof(WireBulkParams,
+                                                    i2s_config.output_types)
+                                           + slot),
+                                1, &new_type);
+                        }
+                        status = 0;
+                    } else {
+                        status = 0xFF;
+                    }
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &status, 1);
                 }
 
                 /* ---- I2S clock / pin config (Console probes these) ---- */

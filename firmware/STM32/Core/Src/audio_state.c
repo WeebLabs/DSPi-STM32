@@ -163,10 +163,21 @@ void init_default_channel_names(void) {
  *  any_delay_active are all defined in dsp_pipeline.c — imported in M7c.) */
 
 /* -------- Output type config (SPDIF / I2S / PDM per output) --------
- * NUM_SPDIF_INSTANCES on RP2350 = 4. Output[0] = SPDIF by default;
- * any output can be flipped to I2S via vendor command. PDM is the
- * fixed extra slot. */
+ * Per-slot output type, persisted via the preset system. NUM_SPDIF_
+ * INSTANCES = 4 on STM32H723 and RP2350, 2 on RP2040.
+ *
+ * STM32 default is all I2S so that the first-ever boot — before any
+ * preset has been saved and apply_factory_defaults runs — lands in the
+ * verified Phase-2 cross-peripheral-sync configuration with audio on
+ * all four pin pairs. SPDIF mode is opt-in per slot via Console; the
+ * SAI re-init it triggers requires a reboot (Phase 4 will lift that). */
+#if defined(STM32H723xx)
+uint8_t output_types[NUM_SPDIF_INSTANCES] = {
+    OUTPUT_TYPE_I2S, OUTPUT_TYPE_I2S, OUTPUT_TYPE_I2S, OUTPUT_TYPE_I2S
+};
+#else
 uint8_t output_types[NUM_SPDIF_INSTANCES] = { 0 };
+#endif
 
 /* -------- I2S output pin / clock config --------
  * Stub for wire compatibility; not active in M7b — the SAI1 audio
