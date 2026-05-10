@@ -44,13 +44,36 @@
  * stereo signals. The earlier build had both DMAs reading the same
  * audio_buf, which collapsed PE6 and PE3 to identical data.
  *
- * AXI SRAM layout (320 KB at 0x24000000):
- *   0x24000000  audio_buf_A (3 KB) — SAI1_A / Out0+1
- *   0x24001000  audio_buf_B (3 KB) — SAI1_B / Out2+3
- *   0x24004000  flash_mirror (48 KB) — preset region (M11)
- * Plenty of room for SAI2 buffers in phase 2 without touching the mirror. */
+ * Memory layout:
+ *
+ *   AXI SRAM (D1 domain, DMA1-reachable, 320 KB at 0x24000000):
+ *     0x24000000  audio_buf_A (3 KB) — SAI1_A / Out0+1 (slot 0)
+ *     0x24001000  audio_buf_B (3 KB) — SAI1_B / Out2+3 (slot 1)
+ *     0x24004000  flash_mirror (48 KB) — preset region (M11)
+ *     0x24010000  DSP scratch (10 × 768 B = 7.5 KB) — buf_l..buf_o7
+ *
+ *   SRAM4 (D3 domain, BDMA-reachable, 16 KB at 0x38000000):
+ *     0x38000000  audio_buf_C (3 KB) — SAI4_A / Out4+5 (slot 2)
+ *     0x38001000  audio_buf_D (3 KB) — SAI4_B / Out6+7 (slot 3)
+ *
+ * SAI4 lives in the D3 power domain and its DMA is BDMA (not DMA1).
+ * BDMA can only reach SRAM4, so slots 2/3's ping-pong rings sit there
+ * instead of AXI SRAM. The AXI bus matrix on H7 doesn't bridge BDMA to
+ * the D1 SRAM region, so a placement mistake fails silently with an
+ * empty buffer. */
 #define AUDIO_BUFFER_BASE_A  0x24000000UL
 #define AUDIO_BUFFER_BASE_B  0x24001000UL
+#define AUDIO_BUFFER_BASE_C  0x38000000UL  /* SRAM4 — BDMA-only */
+#define AUDIO_BUFFER_BASE_D  0x38001000UL  /* MUST be ≥ C + 0xC00.
+                                            * Earlier 0x38000800 stride
+                                            * (2 KB) overlapped C's tail
+                                            * 1024 bytes deep into D's
+                                            * head — slots 2 + 3 ate
+                                            * each other's samples.
+                                            * 4 KB stride matches AXI
+                                            * SRAM (A/B at 0x*0000 /
+                                            * 0x*1000) — keeps the
+                                            * mental model consistent. */
 
 /* 192 stereo frames per ping-pong half × 2 halves × 2 ch = 768 int32 words.
  * 192 frames @ 48 kHz = 4 ms per half — comfortably above any HAL ISR
@@ -61,6 +84,8 @@
 
 static int32_t * const audio_buf_a = (int32_t *)AUDIO_BUFFER_BASE_A;
 static int32_t * const audio_buf_b = (int32_t *)AUDIO_BUFFER_BASE_B;
+static int32_t * const audio_buf_c = (int32_t *)AUDIO_BUFFER_BASE_C;
+static int32_t * const audio_buf_d = (int32_t *)AUDIO_BUFFER_BASE_D;
 
 /* Scratch for one half's worth of stereo 16-bit samples popped from the
  * ring; converted to 24-bit-right-aligned in place into audio_buf[]. */
@@ -68,8 +93,17 @@ static int16_t pop_scratch[AUDIO_FRAMES_HALF * 2];
 
 SAI_HandleTypeDef hsai_BlockA1;
 SAI_HandleTypeDef hsai_BlockB1;
+SAI_HandleTypeDef hsai_BlockA4;     /* phase 2: SAI4 sub-block A — slot 2.
+                                     * H723 has SAI1 + SAI4 (no SAI2/3) —
+                                     * SAI4 is in the D3 power domain and
+                                     * its DMA is BDMA, not DMA1. */
+SAI_HandleTypeDef hsai_BlockB4;     /* phase 2: SAI4 sub-block B — slot 3 */
 DMA_HandleTypeDef hdma_sai1_a;
 DMA_HandleTypeDef hdma_sai1_b;
+DMA_HandleTypeDef hdma_sai4_a;      /* DMA_HandleTypeDef shared between
+                                     * DMA1/2 (D2 domain) and BDMA (D3) —
+                                     * Instance pointer disambiguates. */
+DMA_HandleTypeDef hdma_sai4_b;
 
 volatile uint32_t audio_dma_callbacks = 0;
 volatile uint32_t audio_underruns     = 0;
@@ -169,13 +203,20 @@ static LevellerCoeffs leveller_coeffs;
  *   0x24002F00  buf_o3      (768 B)
  *   0x24004000  flash_mirror (48 KB) — already there
  * Total scratch = 4.5 KB, fits comfortably below the mirror at 0x4000. */
-#define DSP_SCRATCH_BASE  0x24002000UL
+#define DSP_SCRATCH_BASE  0x24010000UL
 static float * const buf_l  = (float *)(DSP_SCRATCH_BASE + 0 * 0x300);
 static float * const buf_r  = (float *)(DSP_SCRATCH_BASE + 1 * 0x300);
 static float * const buf_o0 = (float *)(DSP_SCRATCH_BASE + 2 * 0x300);
 static float * const buf_o1 = (float *)(DSP_SCRATCH_BASE + 3 * 0x300);
 static float * const buf_o2 = (float *)(DSP_SCRATCH_BASE + 4 * 0x300);
 static float * const buf_o3 = (float *)(DSP_SCRATCH_BASE + 5 * 0x300);
+/* Phase 2: 4 more output scratch buffers for SAI2 (Out4..7). Same
+ * 0x300-byte stride. Block ends at 0x24002C00 + 0x300 = 0x24002F00,
+ * still well below audio_buf_C at 0x24003000. */
+static float * const buf_o4 = (float *)(DSP_SCRATCH_BASE + 6 * 0x300);
+static float * const buf_o5 = (float *)(DSP_SCRATCH_BASE + 7 * 0x300);
+static float * const buf_o6 = (float *)(DSP_SCRATCH_BASE + 8 * 0x300);
+static float * const buf_o7 = (float *)(DSP_SCRATCH_BASE + 9 * 0x300);
 
 /* Per-output EQ channel index: Out0 → CH 2, Out1 → CH 3, Out2 → CH 4,
  * Out3 → CH 5. (CH_OUT_n already exist as global config defines but
@@ -185,7 +226,8 @@ static float * const buf_o3 = (float *)(DSP_SCRATCH_BASE + 5 * 0x300);
 #define EQ_CH_OUT2    4
 #define EQ_CH_OUT3    5
 
-static void fill_half(int32_t *dst_a, int32_t *dst_b) {
+static void fill_half(int32_t *dst_a, int32_t *dst_b,
+                      int32_t *dst_c, int32_t *dst_d) {
     /* M7k: snap cycle count at entry; computed at exit and accumulated
      * into a per-window total that gets converted to a % every
      * CPU_METER_BLOCKS calls. Single MRC, ~1 cycle. */
@@ -212,6 +254,14 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b) {
     float g_r_to_o2 = XP_GAIN(1, 2);
     float g_l_to_o3 = XP_GAIN(0, 3);
     float g_r_to_o3 = XP_GAIN(1, 3);
+    float g_l_to_o4 = XP_GAIN(0, 4);
+    float g_r_to_o4 = XP_GAIN(1, 4);
+    float g_l_to_o5 = XP_GAIN(0, 5);
+    float g_r_to_o5 = XP_GAIN(1, 5);
+    float g_l_to_o6 = XP_GAIN(0, 6);
+    float g_r_to_o6 = XP_GAIN(1, 6);
+    float g_l_to_o7 = XP_GAIN(0, 7);
+    float g_r_to_o7 = XP_GAIN(1, 7);
     #undef XP_GAIN
 
     #define POST_GAIN(out) \
@@ -221,6 +271,10 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b) {
     float out1_post_gain = POST_GAIN(1);
     float out2_post_gain = POST_GAIN(2);
     float out3_post_gain = POST_GAIN(3);
+    float out4_post_gain = POST_GAIN(4);
+    float out5_post_gain = POST_GAIN(5);
+    float out6_post_gain = POST_GAIN(6);
+    float out7_post_gain = POST_GAIN(7);
     #undef POST_GAIN
 
     /* M7d: per-input preamp + master volume + bypass snapshots —
@@ -332,24 +386,31 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b) {
                                buf_l, buf_r, AUDIO_FRAMES_HALF);
     }
 
-    /* === Stage 5: matrix mixer → per-output buffers (4 stereo slots). */
+    /* === Stage 5: matrix mixer → per-output buffers (8 outputs / 4
+     * stereo slots). */
     for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
-        buf_o0[k] = buf_l[k] * g_l_to_o0 + buf_r[k] * g_r_to_o0;
-        buf_o1[k] = buf_l[k] * g_l_to_o1 + buf_r[k] * g_r_to_o1;
-        buf_o2[k] = buf_l[k] * g_l_to_o2 + buf_r[k] * g_r_to_o2;
-        buf_o3[k] = buf_l[k] * g_l_to_o3 + buf_r[k] * g_r_to_o3;
+        float il = buf_l[k];
+        float ir = buf_r[k];
+        buf_o0[k] = il * g_l_to_o0 + ir * g_r_to_o0;
+        buf_o1[k] = il * g_l_to_o1 + ir * g_r_to_o1;
+        buf_o2[k] = il * g_l_to_o2 + ir * g_r_to_o2;
+        buf_o3[k] = il * g_l_to_o3 + ir * g_r_to_o3;
+        buf_o4[k] = il * g_l_to_o4 + ir * g_r_to_o4;
+        buf_o5[k] = il * g_l_to_o5 + ir * g_r_to_o5;
+        buf_o6[k] = il * g_l_to_o6 + ir * g_r_to_o6;
+        buf_o7[k] = il * g_l_to_o7 + ir * g_r_to_o7;
     }
 
-    /* === Stage 6: per-output EQ (block-based, channels 2..5). */
+    /* === Stage 6: per-output EQ (block-based, channels 2..9). */
     if (!eq_bypass) {
-        dsp_process_channel_block(filters[EQ_CH_OUT0], buf_o0,
-                                  AUDIO_FRAMES_HALF, EQ_CH_OUT0);
-        dsp_process_channel_block(filters[EQ_CH_OUT1], buf_o1,
-                                  AUDIO_FRAMES_HALF, EQ_CH_OUT1);
-        dsp_process_channel_block(filters[EQ_CH_OUT2], buf_o2,
-                                  AUDIO_FRAMES_HALF, EQ_CH_OUT2);
-        dsp_process_channel_block(filters[EQ_CH_OUT3], buf_o3,
-                                  AUDIO_FRAMES_HALF, EQ_CH_OUT3);
+        dsp_process_channel_block(filters[2], buf_o0, AUDIO_FRAMES_HALF, 2);
+        dsp_process_channel_block(filters[3], buf_o1, AUDIO_FRAMES_HALF, 3);
+        dsp_process_channel_block(filters[4], buf_o2, AUDIO_FRAMES_HALF, 4);
+        dsp_process_channel_block(filters[5], buf_o3, AUDIO_FRAMES_HALF, 5);
+        dsp_process_channel_block(filters[6], buf_o4, AUDIO_FRAMES_HALF, 6);
+        dsp_process_channel_block(filters[7], buf_o5, AUDIO_FRAMES_HALF, 7);
+        dsp_process_channel_block(filters[8], buf_o6, AUDIO_FRAMES_HALF, 8);
+        dsp_process_channel_block(filters[9], buf_o7, AUDIO_FRAMES_HALF, 9);
     }
 
     /* === Stage 6.5: per-output delay (circular delay-line, mirrors RP
@@ -365,13 +426,15 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b) {
      *                large enough (MAX_DELAY_SAMPLES samples) that this
      *                is harmless. */
     if (any_delay_active) {
-        /* Phase 1: extend per-output delay to 4 outputs. delay_lines[]
-         * already has 9 entries (NUM_DELAY_CHANNELS), so no allocation
-         * change. Each output starts from the SAME delay_write_idx; the
-         * global index advances ONCE at the end so all four lines stay
-         * sample-aligned. */
-        float * const buf_outs[4] = { buf_o0, buf_o1, buf_o2, buf_o3 };
-        for (int out = 0; out < 4; ++out) {
+        /* Phase 2: 8 outputs (was 4). delay_lines[] already has 9 entries
+         * (NUM_DELAY_CHANNELS), so no allocation change. Each output
+         * starts from the SAME delay_write_idx; the global index
+         * advances ONCE at the end so all 8 lines stay sample-aligned. */
+        float * const buf_outs[8] = {
+            buf_o0, buf_o1, buf_o2, buf_o3,
+            buf_o4, buf_o5, buf_o6, buf_o7,
+        };
+        for (int out = 0; out < 8; ++out) {
             int32_t dly = channel_delay_samples[out];
             if (dly <= 0) continue;
             float *dline = delay_lines[out];
@@ -387,13 +450,13 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b) {
     }
 
     /* === Stage 7: per-output gain + master volume + clamp + 24-bit
-     *               quantisation. Phase 1: 4 outputs, written into two
-     *               ping-pong buffers (Out0/Out1 -> dst_a interleaved
-     *               L+R, Out2/Out3 -> dst_b interleaved L+R). Peaks +
-     *               clip detection folded into the same loop. */
+     *               quantisation. Phase 2: 8 outputs across 4 stereo
+     *               slots, each slot interleaves L+R into its own DMA
+     *               half (dst_a..dst_d). Peaks + clip detection folded
+     *               into the same loop. */
     float pk_in_l = 0.0f, pk_in_r = 0.0f;
-    float pk_o0 = 0.0f, pk_o1 = 0.0f, pk_o2 = 0.0f, pk_o3 = 0.0f;
-    bool  clip0 = false, clip1 = false, clip2 = false, clip3 = false;
+    float pk_o[8] = { 0 };
+    bool  clip[8] = { false };
 
     for (uint32_t k = 0; k < AUDIO_FRAMES_HALF; ++k) {
         /* Pre-gain "master/input" peaks (track buf_l/buf_r, post-EQ but
@@ -402,52 +465,50 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b) {
         float al = fabsf(buf_l[k]); if (al > pk_in_l) pk_in_l = al;
         float ar = fabsf(buf_r[k]); if (ar > pk_in_r) pk_in_r = ar;
 
-        float o0 = buf_o0[k] * out0_post_gain * master;
-        float o1 = buf_o1[k] * out1_post_gain * master;
-        float o2 = buf_o2[k] * out2_post_gain * master;
-        float o3 = buf_o3[k] * out3_post_gain * master;
+        float o[8] = {
+            buf_o0[k] * out0_post_gain * master,
+            buf_o1[k] * out1_post_gain * master,
+            buf_o2[k] * out2_post_gain * master,
+            buf_o3[k] * out3_post_gain * master,
+            buf_o4[k] * out4_post_gain * master,
+            buf_o5[k] * out5_post_gain * master,
+            buf_o6[k] * out6_post_gain * master,
+            buf_o7[k] * out7_post_gain * master,
+        };
 
-        /* Clip detection BEFORE clamp (RP convention — flag if any sample
-         * tried to exceed full-scale before the limiter hides it). */
-        float ao0 = fabsf(o0); if (ao0 > pk_o0) pk_o0 = ao0;
-        float ao1 = fabsf(o1); if (ao1 > pk_o1) pk_o1 = ao1;
-        float ao2 = fabsf(o2); if (ao2 > pk_o2) pk_o2 = ao2;
-        float ao3 = fabsf(o3); if (ao3 > pk_o3) pk_o3 = ao3;
-        if (ao0 > CLIP_THRESH_F) clip0 = true;
-        if (ao1 > CLIP_THRESH_F) clip1 = true;
-        if (ao2 > CLIP_THRESH_F) clip2 = true;
-        if (ao3 > CLIP_THRESH_F) clip3 = true;
+        for (int i = 0; i < 8; ++i) {
+            /* Clip detection BEFORE clamp (RP convention — flag if any
+             * sample tried to exceed full-scale before the limiter
+             * hides it). */
+            float a = fabsf(o[i]);
+            if (a > pk_o[i]) pk_o[i] = a;
+            if (a > CLIP_THRESH_F) clip[i] = true;
+            if (o[i] >  1.0f) o[i] =  1.0f;
+            else if (o[i] < -1.0f) o[i] = -1.0f;
+        }
 
-        if (o0 >  1.0f) o0 =  1.0f; else if (o0 < -1.0f) o0 = -1.0f;
-        if (o1 >  1.0f) o1 =  1.0f; else if (o1 < -1.0f) o1 = -1.0f;
-        if (o2 >  1.0f) o2 =  1.0f; else if (o2 < -1.0f) o2 = -1.0f;
-        if (o3 >  1.0f) o3 =  1.0f; else if (o3 < -1.0f) o3 = -1.0f;
-
-        dst_a[2*k + 0] = (int32_t)(o0 * FLOAT_TO_24);
-        dst_a[2*k + 1] = (int32_t)(o1 * FLOAT_TO_24);
-        dst_b[2*k + 0] = (int32_t)(o2 * FLOAT_TO_24);
-        dst_b[2*k + 1] = (int32_t)(o3 * FLOAT_TO_24);
+        dst_a[2*k + 0] = (int32_t)(o[0] * FLOAT_TO_24);
+        dst_a[2*k + 1] = (int32_t)(o[1] * FLOAT_TO_24);
+        dst_b[2*k + 0] = (int32_t)(o[2] * FLOAT_TO_24);
+        dst_b[2*k + 1] = (int32_t)(o[3] * FLOAT_TO_24);
+        dst_c[2*k + 0] = (int32_t)(o[4] * FLOAT_TO_24);
+        dst_c[2*k + 1] = (int32_t)(o[5] * FLOAT_TO_24);
+        dst_d[2*k + 0] = (int32_t)(o[6] * FLOAT_TO_24);
+        dst_d[2*k + 1] = (int32_t)(o[7] * FLOAT_TO_24);
     }
 
-    /* Publish to global_status — converted u16 [0..32767]. clip_flags is a
-     * sticky bitmask cleared by REQ_CLEAR_CLIPS so brief overshoots stay
-     * visible until the user explicitly resets. */
+    /* Publish to global_status — converted u16 [0..32767]. clip_flags is
+     * a sticky bitmask cleared by REQ_CLEAR_CLIPS so brief overshoots
+     * stay visible until the user explicitly resets. */
     if (pk_in_l > 1.0f) pk_in_l = 1.0f;
     if (pk_in_r > 1.0f) pk_in_r = 1.0f;
-    if (pk_o0   > 1.0f) pk_o0   = 1.0f;
-    if (pk_o1   > 1.0f) pk_o1   = 1.0f;
-    if (pk_o2   > 1.0f) pk_o2   = 1.0f;
-    if (pk_o3   > 1.0f) pk_o3   = 1.0f;
     global_status.peaks[CH_MASTER_LEFT]  = (uint16_t)(pk_in_l * 32767.0f);
     global_status.peaks[CH_MASTER_RIGHT] = (uint16_t)(pk_in_r * 32767.0f);
-    global_status.peaks[CH_OUT_1]        = (uint16_t)(pk_o0   * 32767.0f);
-    global_status.peaks[CH_OUT_2]        = (uint16_t)(pk_o1   * 32767.0f);
-    global_status.peaks[CH_OUT_3]        = (uint16_t)(pk_o2   * 32767.0f);
-    global_status.peaks[CH_OUT_4]        = (uint16_t)(pk_o3   * 32767.0f);
-    if (clip0) global_status.clip_flags |= (1u << CH_OUT_1);
-    if (clip1) global_status.clip_flags |= (1u << CH_OUT_2);
-    if (clip2) global_status.clip_flags |= (1u << CH_OUT_3);
-    if (clip3) global_status.clip_flags |= (1u << CH_OUT_4);
+    for (int i = 0; i < 8; ++i) {
+        if (pk_o[i] > 1.0f) pk_o[i] = 1.0f;
+        global_status.peaks[CH_OUT_1 + i] = (uint16_t)(pk_o[i] * 32767.0f);
+        if (clip[i]) global_status.clip_flags |= (1u << (CH_OUT_1 + i));
+    }
 
     /* M7k: cycle-count delta for this call. The DWT counter is 32-bit
      * free-running at SYSCLK; the natural unsigned subtract handles
@@ -472,14 +533,16 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b) {
 }
 
 void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai) {
-    /* Only A drives the fill — B's callback fires essentially
-     * simultaneously (shared BCK/FS) and would just refill the same
-     * halves redundantly. We refill BOTH ping-pong halves (A and B) in
-     * one fill_half call so all 4 output channels stay sample-aligned
-     * across the two SAI sub-blocks. */
+    /* Only SAI1_A drives the fill — the other three sub-blocks fire
+     * essentially simultaneously (shared BCK/FS via cross-peripheral
+     * SyncExt) and would just refill the same halves redundantly. One
+     * fill_half call refreshes ALL four ping-pong A-halves so all 8
+     * output channels stay sample-aligned across both SAI peripherals. */
     if (hsai == &hsai_BlockA1) {
         fill_half(&audio_buf_a[0],
-                  &audio_buf_b[0]);
+                  &audio_buf_b[0],
+                  &audio_buf_c[0],
+                  &audio_buf_d[0]);
     }
     ++audio_dma_callbacks;
 }
@@ -487,7 +550,9 @@ void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai) {
 void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai) {
     if (hsai == &hsai_BlockA1) {
         fill_half(&audio_buf_a[AUDIO_FRAMES_HALF * 2],
-                  &audio_buf_b[AUDIO_FRAMES_HALF * 2]);
+                  &audio_buf_b[AUDIO_FRAMES_HALF * 2],
+                  &audio_buf_c[AUDIO_FRAMES_HALF * 2],
+                  &audio_buf_d[AUDIO_FRAMES_HALF * 2]);
     }
     ++audio_dma_callbacks;
 }
@@ -501,6 +566,8 @@ void HAL_SAI_ErrorCallback(SAI_HandleTypeDef *hsai) {
 /* ---------------------------------------------------------------------- */
 void DMA1_Stream0_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_sai1_a); }
 void DMA1_Stream1_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_sai1_b); }
+void BDMA_Channel0_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_sai4_a); }
+void BDMA_Channel1_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_sai4_b); }
 
 /* ---------------------------------------------------------------------- */
 /* Init helpers                                                           */
@@ -523,14 +590,36 @@ static void dma_init_common(DMA_HandleTypeDef *h, DMA_Stream_TypeDef *stream,
     if (HAL_DMA_Init(h) != HAL_OK) Error_Handler();
 }
 
+/* BDMA shares HAL_DMA_Init / DMA_HandleTypeDef but rejects FIFO/burst
+ * fields and uses different request constants. Same Direction/Mode/etc.
+ * The Instance points at a BDMA_Channel rather than a DMA_Stream. */
+static void bdma_init_common(DMA_HandleTypeDef *h, BDMA_Channel_TypeDef *ch,
+                             uint32_t request) {
+    h->Instance                 = (DMA_Stream_TypeDef *)ch;  /* HAL casts internally */
+    h->Init.Request             = request;
+    h->Init.Direction           = DMA_MEMORY_TO_PERIPH;
+    h->Init.PeriphInc           = DMA_PINC_DISABLE;
+    h->Init.MemInc              = DMA_MINC_ENABLE;
+    h->Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+    h->Init.MemDataAlignment    = DMA_MDATAALIGN_WORD;
+    h->Init.Mode                = DMA_CIRCULAR;
+    h->Init.Priority            = DMA_PRIORITY_HIGH;
+    h->Init.FIFOMode            = DMA_FIFOMODE_DISABLE;   /* no FIFO on BDMA */
+    if (HAL_DMA_Init(h) != HAL_OK) Error_Handler();
+}
+
 /* ---------------------------------------------------------------------- */
 /* Public init                                                            */
 /* ---------------------------------------------------------------------- */
 void Audio_Init(void) {
     /* RCC */
     __HAL_RCC_SAI1_CLK_ENABLE();
+    __HAL_RCC_SAI4_CLK_ENABLE();      /* phase 2: slot 2/3 — H723 has SAI1+SAI4 only */
     __HAL_RCC_DMA1_CLK_ENABLE();
-    /* DMAMUX1 has no separate clock-enable on H7. */
+    __HAL_RCC_BDMA_CLK_ENABLE();      /* SAI4 streams go through BDMA */
+    /* DMAMUX1 / DMAMUX2 have no separate clock-enable on H7. */
+    __HAL_RCC_GPIOA_CLK_ENABLE();     /* PA0 = SAI4_SD_B */
+    __HAL_RCC_GPIOD_CLK_ENABLE();     /* PD11 = SAI4_SD_A */
     __HAL_RCC_GPIOE_CLK_ENABLE();
 
     /* GPIO PE2/3/4/5/6 → AF6 (SAI1)
@@ -549,21 +638,58 @@ void Audio_Init(void) {
     };
     HAL_GPIO_Init(GPIOE, &g);
 
-    /* DMA1 Stream 0 → SAI1_A. Stream 1 → SAI1_B. The LINKDMA calls happen
-     * later, AFTER the SAI handles are configured (B's hsai struct is a
-     * post-init clone of A's, which copies A's hdmatx pointer — must be
-     * re-linked to its own DMA stream after the clone or both blocks
-     * end up pointing at A's stream and B's data never moves). */
+    /* SAI4 data pins — clocks are SHARED with SAI1 via SyncExt so we
+     * don't drive PD12/PD13/PE0 (would-be SAI4 FS/SCK/MCLK).
+     *   PD11 = SAI4_SD_A  (AF10)  — slot 2 data
+     *   PA0  = SAI4_SD_B  (AF10)  — slot 3 data
+     * Per H723 datasheet (DS13313) Table 8: PA0/PD11's SAI4 alt is
+     * AF10. The HAL header also defines AF1_SAI4 ("available on
+     * STM32H72xxx/H73xxx") but that's for a different subset of pins
+     * (e.g. PE0's SAI4_MCLK_A) — not these data lines. */
+    GPIO_InitTypeDef g2 = {
+        .Pin       = GPIO_PIN_11,
+        .Mode      = GPIO_MODE_AF_PP,
+        .Pull      = GPIO_NOPULL,
+        .Speed     = GPIO_SPEED_FREQ_VERY_HIGH,
+        .Alternate = GPIO_AF10_SAI4,
+    };
+    HAL_GPIO_Init(GPIOD, &g2);
+
+    g2.Pin       = GPIO_PIN_0;
+    g2.Alternate = GPIO_AF10_SAI4;
+    HAL_GPIO_Init(GPIOA, &g2);
+
+    /* DMA1 Stream 0/1 → SAI1_A/B (D1 domain).
+     * BDMA  Channel 0/1 → SAI4_A/B (D3 domain).
+     * The LINKDMA calls happen later, AFTER the SAI handles are
+     * configured (B's hsai struct is a post-init clone of A's, which
+     * copies A's hdmatx pointer — must be re-linked to its own DMA
+     * stream after the clone or both blocks end up pointing at A's
+     * stream and B's data never moves). */
     dma_init_common(&hdma_sai1_a, DMA1_Stream0, DMA_REQUEST_SAI1_A);
     dma_init_common(&hdma_sai1_b, DMA1_Stream1, DMA_REQUEST_SAI1_B);
+    bdma_init_common(&hdma_sai4_a, BDMA_Channel0, BDMA_REQUEST_SAI4_A);
+    bdma_init_common(&hdma_sai4_b, BDMA_Channel1, BDMA_REQUEST_SAI4_B);
 
     HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
     HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+    HAL_NVIC_SetPriority(BDMA_Channel0_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(BDMA_Channel0_IRQn);
+    HAL_NVIC_SetPriority(BDMA_Channel1_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(BDMA_Channel1_IRQn);
 
     /* SAI1 Block A — I2S Philips master TX, 24-bit / 32-bit slot, 48 kHz.
-     * Generates BCK and FS that B (configured below) reads internally. */
+     * Master clock generator drives BCK and FS internally.
+     *
+     * SynchroExt = SAI_SYNCEXT_OUTBLOCKA_ENABLE writes SAI1->GCR
+     * SYNCOUT=01: broadcast SAI1 Block A's BCK/FS on the cross-peripheral
+     * sync bus so SAI4 (slave-ext) can subscribe via SAI4->GCR.SYNCIN=00.
+     * Per ST Community thread t5/stm32cubemx-mcus/td-p/225165 ("SAI
+     * Synchronous Slave with BDMA"), this is the standard documented
+     * approach for cross-SAI sync; the user there reported zero data
+     * and no IRQs until they enabled this on the master. */
     hsai_BlockA1.Instance              = SAI1_Block_A;
     hsai_BlockA1.Init.AudioMode        = SAI_MODEMASTER_TX;
     hsai_BlockA1.Init.Synchro          = SAI_ASYNCHRONOUS;
@@ -571,7 +697,7 @@ void Audio_Init(void) {
     hsai_BlockA1.Init.NoDivider        = SAI_MASTERDIVIDER_ENABLE;
     hsai_BlockA1.Init.FIFOThreshold    = SAI_FIFOTHRESHOLD_HF;
     hsai_BlockA1.Init.AudioFrequency   = SAI_AUDIO_FREQUENCY_48K;
-    hsai_BlockA1.Init.SynchroExt       = SAI_SYNCEXT_DISABLE;
+    hsai_BlockA1.Init.SynchroExt       = SAI_SYNCEXT_OUTBLOCKA_ENABLE;
     hsai_BlockA1.Init.MonoStereoMode   = SAI_STEREOMODE;
     hsai_BlockA1.Init.CompandingMode   = SAI_NOCOMPANDING;
     hsai_BlockA1.Init.TriState         = SAI_OUTPUT_NOTRELEASED;
@@ -620,11 +746,63 @@ void Audio_Init(void) {
      * still points at A's stream and B's buffer never flows. */
     __HAL_LINKDMA(&hsai_BlockB1, hdmatx, hdma_sai1_b);
 
-    /* Pre-fill both buffers with silence so the first BCK edges after
-     * Audio_Start ship zero samples until USB starts delivering. */
+    /* Phase 2: SAI4 sub-block A — synchronous-external slave to SAI1
+     * Block A, via the documented cross-peripheral sync bus.
+     *
+     * HAL Synchro = SAI_SYNCHRONOUS_EXT_SAI1 writes:
+     *   SAI4_A->CR1.SYNCEN[11:10] = 0b10  (sync from external SAI)
+     *   SAI4->GCR.SYNCIN[1:0]     = 0b00  (selects SAI1 as the source)
+     * Combined with SAI1->GCR.SYNCOUT=01 above (set by SynchroExt on
+     * SAI1_A), this routes SAI1_A's BCK/FS through the on-chip mesh
+     * into SAI4_A's slave clock input. SAI4 doesn't run its own MCG
+     * in this mode, so MckOutput=DISABLE (and consequently MCKEN=0)
+     * is correct — the slave clock arrives via the sync bus. */
+    hsai_BlockA4 = hsai_BlockA1;            /* whole-struct clone */
+    hsai_BlockA4.Instance          = SAI4_Block_A;
+    hsai_BlockA4.Init.AudioMode    = SAI_MODESLAVE_TX;
+    hsai_BlockA4.Init.Synchro      = SAI_SYNCHRONOUS_EXT_SAI1;
+    hsai_BlockA4.Init.SynchroExt   = SAI_SYNCEXT_DISABLE;
+    hsai_BlockA4.Init.MckOutput    = SAI_MCK_OUTPUT_DISABLE;
+    /* Restore standard config (NoDivider/OutputDrive cloned from SAI1). */
+    hsai_BlockA4.Lock           = HAL_UNLOCKED;
+    hsai_BlockA4.State          = HAL_SAI_STATE_RESET;
+    hsai_BlockA4.ErrorCode      = HAL_SAI_ERROR_NONE;
+    if (HAL_SAI_InitProtocol(&hsai_BlockA4, SAI_I2S_STANDARD,
+                             SAI_PROTOCOL_DATASIZE_24BIT, 2) != HAL_OK) {
+        Error_Handler();
+    }
+    __HAL_LINKDMA(&hsai_BlockA4, hdmatx, hdma_sai4_a);
+
+    /* Phase 2: SAI4 sub-block B — synchronous-internal slave to SAI4_A
+     * (which is itself sync-external slave to SAI1_A). Three-deep sync
+     * chain, all driven by SAI1_A's clock generator. */
+    hsai_BlockB4 = hsai_BlockA4;
+    hsai_BlockB4.Instance          = SAI4_Block_B;
+    hsai_BlockB4.Init.AudioMode    = SAI_MODESLAVE_TX;
+    hsai_BlockB4.Init.Synchro      = SAI_SYNCHRONOUS;
+    hsai_BlockB4.Init.MckOutput    = SAI_MCK_OUTPUT_DISABLE;
+    hsai_BlockB4.Lock              = HAL_UNLOCKED;
+    hsai_BlockB4.State             = HAL_SAI_STATE_RESET;
+    hsai_BlockB4.ErrorCode         = HAL_SAI_ERROR_NONE;
+    if (HAL_SAI_InitProtocol(&hsai_BlockB4, SAI_I2S_STANDARD,
+                             SAI_PROTOCOL_DATASIZE_24BIT, 2) != HAL_OK) {
+        Error_Handler();
+    }
+    __HAL_LINKDMA(&hsai_BlockB4, hdmatx, hdma_sai4_b);
+
+    /* Cross-peripheral sync registers programmed via HAL above:
+     *   SAI1->GCR = 0x00000010  (SYNCOUT=01, block A broadcasts)
+     *   SAI4->GCR = 0x00000000  (SYNCIN=00, listen to SAI1)
+     *   SAI4_A->CR1 SYNCEN[11:10] = 0b10  (sync from external SAI)
+     *   SAI4_B->CR1 SYNCEN[11:10] = 0b01  (sync to SAI4_A internal) */
+
+    /* Pre-fill ALL FOUR buffers with silence so the first BCK edges
+     * after Audio_Start ship zero samples until USB starts delivering. */
     for (uint32_t i = 0; i < AUDIO_WORDS_TOTAL; ++i) {
         audio_buf_a[i] = 0;
         audio_buf_b[i] = 0;
+        audio_buf_c[i] = 0;
+        audio_buf_d[i] = 0;
     }
 
     /* M7d: init crossfeed + leveller state + initial coefficients.
@@ -641,25 +819,55 @@ void Audio_Init(void) {
 }
 
 void Audio_Start(void) {
-    /* Phase 1: each sub-block streams from its OWN AXI SRAM ring.
-     * SAI1_A drains audio_buf_a (Out0/Out1 stereo on PE6); SAI1_B drains
-     * audio_buf_b (Out2/Out3 stereo on PE3). Two DMAs targeting separate
-     * SRAM addresses — no contention beyond AXI bus bandwidth (trivial
-     * at 6 MB/s combined).
+    /* Phase 2 master/master sync strategy.
      *
-     * Start the synchronous slave (B) FIRST so its DMA + SAIEN are
-     * armed and waiting on A's BCK/FS edges. Then start A — the moment
-     * A's SAIEN goes high, BCK/FS begin toggling and B shifts out its
-     * first sample on the same edge as A's, giving sample-aligned
-     * output across both pin pairs. */
+     * SAI1 and SAI4 are independent masters off the same PLL2_P kernel
+     * clock — frequency-locked. To make them PHASE-locked too, we need
+     * both A-block SAIEN bits to assert within the same kernel-clock
+     * cycle (PLL2_P period = 20 ns at 49.152 MHz). Without that, the
+     * two clock generators latch their start on different kernel
+     * edges and end up with a permanent BCK/FS phase offset (could be
+     * several BCK cycles = sub-sample on a single sample, but worst
+     * case ~0.5 sample of offset).
+     *
+     * HAL_SAI_Transmit_DMA does a lot — DMA arming, FIFO flush, then
+     * SAIEN. Calling it sequentially for SAI1 and SAI4 takes µs, way
+     * more than 20 ns. Approach: call HAL on all four blocks (which
+     * sets SAIEN on each as part of its flow), then immediately CLEAR
+     * SAIEN on both A-block masters, then re-assert both SAIEN bits
+     * in back-to-back CPU stores inside an irq-disabled critical
+     * section. Two adjacent stores at SYSCLK 550 MHz are ~2 ns apart,
+     * comfortably inside one PLL2_P kernel cycle. The B sub-blocks
+     * (sync-internal to their A) follow A automatically when A re-
+     * enables — slave logic resumes from the next FS edge.
+     *
+     * Note SAI1's IRQ-driven half/full-cplt callbacks are the ONLY
+     * source of fill_half() calls; if they're armed before SAIEN goes
+     * high they sit idle waiting for DMA-half events. Disabling-then-
+     * re-enabling SAIEN doesn't disturb the DMA arming state, so when
+     * SAIEN comes back high the DMA controller resumes shipping the
+     * already-buffered samples.
+     */
+    /* Start order: B sub-blocks first (slaves; sync-internal to their A),
+     * then A masters last. Both A masters run from PLL2_P, so they're
+     * frequency-locked = zero drift across all 8 outputs. The static
+     * start-phase offset between SAI1_A and SAI4_A is bounded by the
+     * inter-call execution time (~5–10 µs ≈ 0.3–0.5 sample at 48 kHz),
+     * fixed at boot and reproducible. The earlier attempt at pulling
+     * both SAIEN bits low and re-asserting them in the same kernel
+     * cycle deadlocked SAI1 because RM0468 makes SAIEN-clear
+     * effective only at end-of-frame (20.8 µs later) — a 180 ns wait
+     * left both blocks in an undefined "disable pending" state. */
+    if (HAL_SAI_Transmit_DMA(&hsai_BlockB4,
+                             (uint8_t *)audio_buf_d,
+                             AUDIO_WORDS_TOTAL) != HAL_OK) Error_Handler();
+    if (HAL_SAI_Transmit_DMA(&hsai_BlockA4,
+                             (uint8_t *)audio_buf_c,
+                             AUDIO_WORDS_TOTAL) != HAL_OK) Error_Handler();
     if (HAL_SAI_Transmit_DMA(&hsai_BlockB1,
                              (uint8_t *)audio_buf_b,
-                             AUDIO_WORDS_TOTAL) != HAL_OK) {
-        Error_Handler();
-    }
+                             AUDIO_WORDS_TOTAL) != HAL_OK) Error_Handler();
     if (HAL_SAI_Transmit_DMA(&hsai_BlockA1,
                              (uint8_t *)audio_buf_a,
-                             AUDIO_WORDS_TOTAL) != HAL_OK) {
-        Error_Handler();
-    }
+                             AUDIO_WORDS_TOTAL) != HAL_OK) Error_Handler();
 }

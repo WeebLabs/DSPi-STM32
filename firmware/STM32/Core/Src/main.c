@@ -273,10 +273,16 @@ static void SystemClock_Config(void) {
     clk.APB4CLKDivider = RCC_APB4_DIV2;
     if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_4) != HAL_OK) Error_Handler();
 
-    /* PLL2 — audio kernel clock 49.15223 MHz (FRACN). Section 0.5. */
+    /* PLL2 — audio kernel clock 49.15223 MHz (FRACN). Section 0.5.
+     * SAI4 (D3 domain) needs explicit kernel-clock source selection too;
+     * default after reset is PLL1Q which doesn't match the audio rate.
+     * Both SAI4_A and SAI4_B point at PLL2P so they're sample-locked to
+     * SAI1 even when running with their own kernel clocks. */
     periph.PeriphClockSelection = RCC_PERIPHCLK_USART1
                                 | RCC_PERIPHCLK_USB
-                                | RCC_PERIPHCLK_SAI1;
+                                | RCC_PERIPHCLK_SAI1
+                                | RCC_PERIPHCLK_SAI4A
+                                | RCC_PERIPHCLK_SAI4B;
     /* PLL2 — audio kernel clock 49.151978 MHz */
     periph.PLL2.PLL2M = 5;        /* 25/5 = 5 MHz VCO input */
     periph.PLL2.PLL2N = 98;
@@ -304,6 +310,8 @@ static void SystemClock_Config(void) {
     periph.Usart16ClockSelection = RCC_USART16CLKSOURCE_D2PCLK2;
     periph.UsbClockSelection     = RCC_USBCLKSOURCE_PLL3;
     periph.Sai1ClockSelection    = RCC_SAI1CLKSOURCE_PLL2;
+    periph.Sai4AClockSelection   = RCC_SAI4ACLKSOURCE_PLL2;
+    periph.Sai4BClockSelection   = RCC_SAI4BCLKSOURCE_PLL2;
     if (HAL_RCCEx_PeriphCLKConfig(&periph) != HAL_OK) Error_Handler();
 }
 
