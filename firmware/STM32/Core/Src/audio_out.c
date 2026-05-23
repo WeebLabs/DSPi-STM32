@@ -35,6 +35,8 @@
 #include "crossfeed.h"     /* M7d: BS2B crossfeed */
 #include "leveller.h"      /* M7d: volume leveller */
 #include "loudness.h"      /* M7i: loudness compensation */
+#include "audio_input.h"   /* M9: active_input_source */
+#include "spdif_input.h"   /* M9: spdif_input_pop_frames */
 #include "notify.h"        /* M12 P4: notify_param_write on coerce */
 #include "bulk_params.h"   /* M12 P4: WireBulkParams offsetof for notify */
 #include <math.h>          /* M7e: fabsf for level meters */
@@ -236,7 +238,17 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
      * CPU_METER_BLOCKS calls. Single MRC, ~1 cycle. */
     uint32_t cpu_t0 = DWT->CYCCNT;
 
-    uint32_t got = usb_ring_pop_frames(pop_scratch, AUDIO_FRAMES_HALF);
+    /* M9: source samples from the active input. SPDIF path drains
+     * the SPDIFRX demux ring; USB path drains the UAC1 OUT ring. The
+     * downstream DSP graph is identical either way — same int16
+     * stereo format, same fill convention (silence-pad on shortfall),
+     * same starvation accounting. */
+    uint32_t got;
+    if (active_input_source == INPUT_SOURCE_SPDIF) {
+        got = spdif_input_pop_frames(pop_scratch, AUDIO_FRAMES_HALF);
+    } else {
+        got = usb_ring_pop_frames(pop_scratch, AUDIO_FRAMES_HALF);
+    }
     if (got < AUDIO_FRAMES_HALF) ++audio_underruns;
 
     /* Snapshot the matrix crosspoints once per buffer-half (≪ 1 µs each)

@@ -21,8 +21,8 @@ typedef enum {
 
 #define INPUT_SOURCE_MAX    INPUT_SOURCE_SPDIF   // Highest valid value
 
-// Default SPDIF RX GPIO pin
-#define PICO_SPDIF_RX_PIN_DEFAULT  11
+// Default SPDIF RX GPIO pin. On STM32 this is PD8 / WeAct P1 pin 40.
+#define PICO_SPDIF_RX_PIN_DEFAULT  8
 
 // SPDIF RX lock debounce — firmware constant, not configurable via vendor command.
 // After the library reports lock, wait this many ms before unmuting output.

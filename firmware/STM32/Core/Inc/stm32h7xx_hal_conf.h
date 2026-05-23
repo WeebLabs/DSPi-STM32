@@ -33,6 +33,7 @@ extern "C" {
 #define HAL_PWR_MODULE_ENABLED
 #define HAL_RCC_MODULE_ENABLED
 #define HAL_SAI_MODULE_ENABLED
+#define HAL_SPDIFRX_MODULE_ENABLED      /* M9: SPDIF receiver */
 #define HAL_UART_MODULE_ENABLED
 
 /* The following modules will be re-enabled when their milestone arrives.
@@ -107,6 +108,9 @@ extern "C" {
 #endif
 #ifdef HAL_SAI_MODULE_ENABLED
   #include "stm32h7xx_hal_sai.h"
+#endif
+#ifdef HAL_SPDIFRX_MODULE_ENABLED
+  #include "stm32h7xx_hal_spdifrx.h"
 #endif
 #ifdef HAL_ADC_MODULE_ENABLED
   #include "stm32h7xx_hal_adc.h"

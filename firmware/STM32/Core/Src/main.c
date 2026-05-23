@@ -30,6 +30,8 @@
 #include "w25q.h"
 #include "flash_clkdiv.h"
 #include "flash_storage.h"
+#include "audio_input.h"   /* M9: input source switching */
+#include "spdif_input.h"   /* M9: SPDIFRX peripheral driver */
 #include <stdio.h>
 #include <string.h>
 
@@ -135,12 +137,21 @@ int main(void) {
     Audio_Init();     /* SAI1_A + DMA1_Stream0 + sine table fill */
     Audio_Start();    /* kick off circular DMA — 1 kHz tone on PE6 SD */
 
+    /* M9 stage 1: SPDIFRX peripheral up. Initialised but not armed —
+     * spdif_input_start() is called when Console switches input source
+     * to SPDIF (REQ_SET_INPUT_SOURCE 0xE0). Also auto-started below if
+     * the persisted preset has SPDIF as the active input. */
+    spdif_input_init();
+    if (active_input_source == INPUT_SOURCE_SPDIF) {
+        spdif_input_start();
+    }
+
     printf("\r\n");
     printf("=== DSPi STM32H723 — M4 SAI1_A 1 kHz tone ===\r\n");
     printf("  SYSCLK    = %lu Hz\r\n", (unsigned long)HAL_RCC_GetSysClockFreq());
     printf("  HCLK      = %lu Hz\r\n", (unsigned long)HAL_RCC_GetHCLKFreq());
     printf("  HSE       = %lu Hz (board crystal)\r\n", (unsigned long)HSE_VALUE);
-    printf("  USB FS    = PLL3Q -> 48 MHz (UAC1, VID 0xCAFE PID 0x4002)\r\n");
+    printf("  USB FS    = PLL3Q -> 48 MHz (UAC1, VID 0x2E8B PID 0xFEAA)\r\n");
     printf("  SAI kclk  = %lu Hz (PLL2_P)\r\n",
            (unsigned long)HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SAI1));
     printf("  Audio out = SAI1_A I2S Philips 24-bit, MCLK PE2 / FS PE4 / SCK PE5 / SD PE6\r\n");
@@ -232,6 +243,41 @@ int main(void) {
             Audio_HotSwap();
         }
 
+        /* M9 stage 1: drain runtime input-source changes. Set by
+         * REQ_SET_INPUT_SOURCE (0xE0) and by bulk SET / preset load
+         * paths; applied here so we don't start SPDIFRX from USB ISR
+         * context (HAL_SPDIFRX_Receive*_DMA blocks in the SYNC poll
+         * for ~3 ms on no-signal). */
+        if (input_source_change_pending) {
+            input_source_change_pending = false;
+            uint8_t want = pending_input_source;
+            if (want != active_input_source && input_source_valid(want)) {
+                /* Flip the source first so fill_half starts reading
+                 * from the new ring immediately — for USB→SPDIF this
+                 * gives us a natural silence window while the SPDIF
+                 * ring fills (avoids the cross-source click); for
+                 * SPDIF→USB the USB ring takes over instantly. */
+                active_input_source = want;
+                if (want == INPUT_SOURCE_SPDIF) spdif_input_start();
+                else                            spdif_input_stop();
+                /* Notify shadow tracks the actually-applied state so
+                 * Console's "stats for nerds" reflects truth even if
+                 * spdif_input_start fails to lock (state stays
+                 * ACQUIRING until a signal arrives). */
+                uint8_t snap = active_input_source;
+                notify_param_write(
+                    (uint16_t)offsetof(WireBulkParams,
+                                       input_config.input_source),
+                    1, &snap);
+            }
+        }
+
+        /* M9 stage 1: SPDIFRX state-machine tick — refreshes lock
+         * state + sample-rate measurement so REQ_GET_SPDIF_RX_STATUS
+         * returns current values. Cheap (single SR read) when not
+         * locked. */
+        spdif_input_poll();
+
         uint32_t now = HAL_GetTick();
         bool mounted = tud_mounted();
         if (mounted) was_ever_mounted = true;
@@ -296,13 +342,22 @@ static void SystemClock_Config(void) {
                                 | RCC_PERIPHCLK_USB
                                 | RCC_PERIPHCLK_SAI1
                                 | RCC_PERIPHCLK_SAI4A
-                                | RCC_PERIPHCLK_SAI4B;
+                                | RCC_PERIPHCLK_SAI4B
+                                | RCC_PERIPHCLK_SPDIFRX;
     /* PLL2 — audio kernel clock 49.151978 MHz */
     periph.PLL2.PLL2M = 5;        /* 25/5 = 5 MHz VCO input */
     periph.PLL2.PLL2N = 98;
-    periph.PLL2.PLL2P = 10;       /* VCO 491.52 MHz / 10 → 49.15198 MHz */
+    periph.PLL2.PLL2P = 10;       /* VCO 491.52 MHz / 10 → 49.15198 MHz (SAI kclk) */
     periph.PLL2.PLL2Q = 2;
-    periph.PLL2.PLL2R = 2;
+    /* M9: SPDIFRX peripheral kernel clock = PLL2_R. RM0468 §38 + AN5073
+     * specify a minimum SPDIFRX kernel clock of ~70.4 MHz (need enough
+     * over-sampling of the 6.144 MHz biphase rate at 48 kHz for the
+     * CDR to measure pulse widths accurately). 245 MHz (PLL2_R with
+     * R=2) was too fast and 61 MHz (R=8) was too slow. R=5 →
+     * 491.52/5 = 98.3 MHz lands in the middle of the documented
+     * 70.4 MHz–200 MHz working window. PLL2_P stays at 49.152 MHz
+     * via P=10, so SAI audio is unaffected. */
+    periph.PLL2.PLL2R = 5;
     periph.PLL2.PLL2RGE    = RCC_PLL2VCIRANGE_2;   /* 4–8 MHz: 5 MHz fits */
     periph.PLL2.PLL2VCOSEL = RCC_PLL2VCOWIDE;      /* wide 192–836 MHz */
     periph.PLL2.PLL2FRACN  = 2490;                 /* −0.45 ppm vs 49.152 MHz */
@@ -326,6 +381,13 @@ static void SystemClock_Config(void) {
     periph.Sai1ClockSelection    = RCC_SAI1CLKSOURCE_PLL2;
     periph.Sai4AClockSelection   = RCC_SAI4ACLKSOURCE_PLL2;
     periph.Sai4BClockSelection   = RCC_SAI4BCLKSOURCE_PLL2;
+    /* M9: SPDIFRX kernel clock from PLL2_R (98.304 MHz). Same PLL as
+     * the SAI audio so a future audio-routed-loopback path stays
+     * frequency-locked end-to-end. The peripheral only uses this clock
+     * internally for CDR threshold comparisons + the WIDTH5 sample-
+     * rate measurement; keep it inside the documented 70.4-200 MHz
+     * SPDIFRX working window. */
+    periph.SpdifrxClockSelection = RCC_SPDIFRXCLKSOURCE_PLL2;
     if (HAL_RCCEx_PeriphCLKConfig(&periph) != HAL_OK) Error_Handler();
 }
 

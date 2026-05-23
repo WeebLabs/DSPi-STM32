@@ -55,7 +55,7 @@ The full DSPi feature set fits if camera/TFT are not installed and the OSPI flas
 | SAI2_FS_A | PD12 | Was OSPI_BK1_IO1 |
 | SAI2_SD_A | PD11 | Was OSPI_BK1_IO0 — **third audio output** |
 | SAI2_SD_B | PA0 | Free header pin — **fourth audio output, internal slave to SAI2_A** |
-| SPDIFRX_IN3 | PD8 | Free header pin (alt: PB7 if camera not installed) |
+| SPDIFRX1_IN2 | PD8 / D8 | Free header pin (AF9, WeAct P1 pin 40; HAL/RM INSEL=1) |
 | SPI2_SCK (PDM CLK) | PB13 | Free |
 | SPI2_MOSI (PDM data) | PB15 | Free |
 | I2C target SCL/SDA | PB10 / PB11 | I2C2 — both free header pins |

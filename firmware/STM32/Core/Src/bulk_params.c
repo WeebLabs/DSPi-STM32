@@ -194,7 +194,10 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     if (in->header.format_version < 2 || in->header.format_version > WIRE_FORMAT_VERSION)
         return -1;
 
-#if PICO_RP2350
+#if defined(STM32H723xx)
+    if (in->header.platform_id != WIRE_PLATFORM_STM32H723)
+        return -2;
+#elif PICO_RP2350
     if (in->header.platform_id != WIRE_PLATFORM_RP2350)
         return -2;
 #else
@@ -282,7 +285,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
 
     // Pin config
     if (apply_pins) {
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
         static const uint8_t default_pins[NUM_PIN_OUTPUTS] = {
             PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2,
             PICO_SPDIF_PIN_3, PICO_SPDIF_PIN_4, PICO_PDM_PIN

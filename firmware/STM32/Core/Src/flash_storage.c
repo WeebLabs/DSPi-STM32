@@ -756,7 +756,7 @@ static void apply_slot_to_live(const PresetSlot *slot, bool include_pins) {
 
     // Pin configuration (conditional)
     if (include_pins) {
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
         static const uint8_t default_pins[NUM_PIN_OUTPUTS] = {
             PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2,
             PICO_SPDIF_PIN_3, PICO_SPDIF_PIN_4, PICO_PDM_PIN
@@ -1356,7 +1356,7 @@ static void apply_factory_defaults(void) {
     // Reset pin configuration
     output_pins[0] = PICO_AUDIO_SPDIF_PIN;
     output_pins[1] = PICO_SPDIF_PIN_2;
-#if PICO_RP2350
+#if PICO_RP2350 || defined(STM32H723xx)
     output_pins[2] = PICO_SPDIF_PIN_3;
     output_pins[3] = PICO_SPDIF_PIN_4;
     output_pins[4] = PICO_PDM_PIN;

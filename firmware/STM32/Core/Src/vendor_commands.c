@@ -23,7 +23,8 @@
 #include "dsp_pipeline.h"
 
 #include "usb_audio.h"   /* update_master_volume, AudioState, channel_names */
-#include "audio_input.h" /* INPUT_SOURCE_USB */
+#include "audio_input.h" /* INPUT_SOURCE_USB / SPDIF + change-pending flag */
+#include "spdif_input.h" /* M9: SpdifRxStatusPacket + status accessor */
 #include "notify.h"      /* notify_param_write — M7j */
 #include "flash_storage.h"  /* preset_save / load / delete / etc. — M11 */
 #include "w25q.h"           /* debug GETs probe W25Q directly */
@@ -209,10 +210,30 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                             (tusb_control_request_t *)req, &v, 4);
                 }
                 case REQ_GET_INPUT_SOURCE: {
-                    /* USB-only on STM32 until M8 brings SPDIFRX. */
-                    static uint8_t src = INPUT_SOURCE_USB;
+                    static uint8_t src;
+                    src = active_input_source;
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &src, 1);
+                }
+                /* REQ_SET_INPUT_SOURCE — NOT handled here. Despite the
+                 * name and our REQ_SET_OUTPUT_TYPE precedent (which IS
+                 * a side-effecting vendor IN), this one is a plain
+                 * vendor OUT with a 1-byte DATA payload per the RP
+                 * convention. See the SET/DATA-stage handler below. */
+
+                case REQ_GET_SPDIF_RX_STATUS: {
+                    static SpdifRxStatusPacket pkt;
+                    spdif_input_get_status(&pkt);
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &pkt, sizeof(pkt));
+                }
+                case REQ_GET_SPDIF_RX_CH_STATUS: {
+                    static uint8_t cs[24];
+                    spdif_input_get_channel_status(cs);
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            cs, sizeof(cs));
                 }
 
                 case REQ_GET_BYPASS: {
@@ -328,6 +349,127 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                     buf[1] = (uint8_t)((SAI1_Block_B->CR1 >> 2) & 0x3);
                     buf[2] = (uint8_t)((SAI4_Block_A->CR1 >> 2) & 0x3);
                     buf[3] = (uint8_t)((SAI4_Block_B->CR1 >> 2) & 0x3);
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
+                case 0xF2: {  /* DEBUG (M9): runtime switch SPDIFRX INSEL
+                               * field. wValue lo byte = new INSEL value
+                               * (0..3). Restarts the SYNC state machine
+                               * on the new input. Returns the new CR
+                               * value (4 bytes) so caller can confirm. */
+                    uint32_t insel = req->wValue & 0x3;
+                    /* Disable peripheral, change INSEL, re-enable SYNC. */
+                    SPDIFRX->CR &= ~SPDIFRX_CR_SPDIFEN;
+                    while (SPDIFRX->CR & SPDIFRX_CR_SPDIFEN) ;
+                    SPDIFRX->CR = (SPDIFRX->CR & ~SPDIFRX_CR_INSEL)
+                                | (insel << 16);
+                    SPDIFRX->CR |= 1;   /* SPDIFEN[1:0] = 01 (SYNC) */
+                    static uint32_t resp;
+                    resp = SPDIFRX->CR;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &resp, 4);
+                }
+                case 0xF4: {  /* DEBUG (M9): SPDIFRX register snapshot.
+                               * 32-byte payload, u32 LE: */
+                    static uint32_t buf[8];
+                    buf[0] = SPDIFRX->CR;
+                    buf[1] = SPDIFRX->SR;
+                    buf[2] = SPDIFRX->IMR;
+                    buf[3] = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SPDIFRX);
+                    buf[4] = GPIOD->AFR[1];       /* PD8 AF nibble bits[3:0] of AFR[1] */
+                    buf[5] = GPIOD->MODER;        /* PD8 mode bits[17:16] */
+                    buf[6] = GPIOD->PUPDR;        /* PD8 pull bits[17:16] */
+                    buf[7] = (uint32_t)HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_8)
+                           | ((uint32_t)(GPIOD->IDR & GPIO_PIN_8) << 8);
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
+                case 0xF6: {  /* DEBUG (M9): PD8 as plain INPUT + internal
+                               * pull-up, AF routing disconnected. Used
+                               * during M9 bring-up to isolate whether
+                               * the active AF (originally AF8, since
+                               * fixed to AF9) was routing PD8 to a
+                               * conflicting peripheral that drove the
+                               * line low. With AF disconnected the pin
+                               * goes high (pull-up wins), proving the
+                               * AF mux was the culprit, not the
+                               * SPDIFRX block itself.
+                               *
+                               * Also disables SPDIFEN to take the
+                               * SPDIFRX peripheral cleanly out of the
+                               * picture for the test. */
+                    __HAL_RCC_GPIOD_CLK_ENABLE();
+                    /* Force SPDIFRX peripheral OFF — SPDIFEN field to 00 */
+                    SPDIFRX->CR &= ~(0x3u << 0);
+                    /* MODER bits[17:16] = 00 (INPUT) */
+                    GPIOD->MODER &= ~(0x3u << 16);
+                    /* OTYPER bit 8: don't care in input mode */
+                    /* PUPDR bits[17:16] = 01 (pull-up) */
+                    GPIOD->PUPDR  &= ~(0x3u << 16);
+                    GPIOD->PUPDR  |=  (0x1u << 16);
+                    /* AFRH nibble[3:0] = 0 */
+                    GPIOD->AFR[1] &= ~0xFu;
+
+                    static uint32_t buf[5];
+                    buf[0] = GPIOD->MODER;
+                    buf[1] = GPIOD->PUPDR;
+                    buf[2] = GPIOD->AFR[1];
+                    buf[3] = GPIOD->IDR;
+                    buf[4] = SPDIFRX->CR;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
+                case 0xF5: {  /* DEBUG (M9): drive PD8 as a plain GPIO
+                               * push-pull output HIGH, bypassing the AF
+                               * routing (clears AFR nibble). Used during
+                               * M9 bring-up to prove the pad itself was
+                               * healthy when AF routing was suspect.
+                               * Returns the resulting MODER, PUPDR, ODR
+                               * and live IDR so the host can confirm the
+                               * config actually landed. If the pin still
+                               * reads 0 V externally with this command
+                               * issued, the silicon is damaged. */
+                    __HAL_RCC_GPIOD_CLK_ENABLE();
+                    /* MODER bits[17:16] for PD8 — clear then set to 01 (output) */
+                    GPIOD->MODER &= ~(0x3u << 16);
+                    GPIOD->MODER |=  (0x1u << 16);
+                    /* OTYPER bit 8 = 0 (push-pull) */
+                    GPIOD->OTYPER &= ~(1u << 8);
+                    /* OSPEEDR bits[17:16] = 11 (very high) */
+                    GPIOD->OSPEEDR |= (0x3u << 16);
+                    /* PUPDR bits[17:16] = 00 (no pull — output drives it) */
+                    GPIOD->PUPDR  &= ~(0x3u << 16);
+                    /* AFRH nibble [3:0] = 0 — irrelevant in OUTPUT mode but
+                     * tidy. */
+                    GPIOD->AFR[1] &= ~0xFu;
+                    /* Drive HIGH via BSRR */
+                    GPIOD->BSRR = (1u << 8);
+
+                    static uint32_t buf[4];
+                    buf[0] = GPIOD->MODER;
+                    buf[1] = GPIOD->PUPDR;
+                    buf[2] = GPIOD->ODR;
+                    buf[3] = GPIOD->IDR;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
+                case 0xF3: {  /* DEBUG (M9): RCC + PLL2 + SPDIFRX clock-tree
+                               * snapshot — figure out where the kernel
+                               * clock got lost. 28-byte payload, u32 LE: */
+                    static uint32_t buf[7];
+                    buf[0] = RCC->CR;        /* PLL2RDY in bit 27         */
+                    buf[1] = RCC->PLLCFGR;   /* DIVPxEN/DIVQxEN/DIVRxEN
+                                              * + FRACEN per PLL          */
+                    buf[2] = RCC->PLL2DIVR;  /* DIVN/P/Q/R values         */
+                    buf[3] = RCC->PLL2FRACR; /* FRACN[12:0]               */
+                    buf[4] = RCC->D2CCIP1R;  /* SPDIFSEL bits[21:20]      */
+                    buf[5] = RCC->APB1LENR;  /* SPDIFRXEN bit 16          */
+                    buf[6] = RCC->CFGR;      /* general clk source        */
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req,
                                             buf, sizeof(buf));
@@ -577,9 +719,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                             (tusb_control_request_t *)req, &v, 1);
                 }
 
-                /* ---- SPDIF RX pin (no SPDIF RX in M7d) ---- */
+                /* ---- SPDIF RX pin (fixed PD8 / WeAct P1 pin 40 on STM32) ---- */
                 case REQ_GET_SPDIF_RX_PIN: {
-                    static uint8_t v = 0;
+                    static uint8_t v;
+                    v = spdif_rx_pin;
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 1);
                 }
@@ -1198,6 +1341,27 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                         (uint16_t)(offsetof(WireBulkParams, i2s_config.output_types)
                                    + slot),
                         1, &new_type);
+                }
+                break;
+            }
+
+            case REQ_SET_INPUT_SOURCE: {
+                /* Console sends this as a plain vendor OUT with a
+                 * 1-byte payload: vendor_rx_buf[0] = InputSource enum
+                 * value. Mirror the RP convention exactly — the apply
+                 * runs in main-loop context to keep HAL_SPDIFRX_* and
+                 * PLL2 manipulation out of USB ISR. The notify is
+                 * fired at apply time in main.c, not here, so the
+                 * Console shadow tracks the active state rather than
+                 * the requested-but-not-yet-applied state. */
+                if (vendor_last_wLength >= 1) {
+                    uint8_t src = vendor_rx_buf[0];
+                    if (input_source_valid(src)
+                        && src != active_input_source) {
+                        pending_input_source = src;
+                        __DMB();
+                        input_source_change_pending = true;
+                    }
                 }
                 break;
             }
