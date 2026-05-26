@@ -402,6 +402,25 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                             (tusb_control_request_t *)req,
                                             &st, 1);
                 }
+                case 0xEC: {  /* DEBUG (M9): per-stage cycle counters from
+                               * fill_half. Returns 9 u32: count of
+                               * fill_half calls since last read, then 8
+                               * stage cycle accumulators. Snapshot-and-
+                               * reset semantics so each probe shows the
+                               * window since the previous probe. */
+                    extern volatile uint32_t audio_stage_cycles[8];
+                    extern volatile uint32_t audio_stage_calls;
+                    static uint32_t buf[9];
+                    buf[0] = audio_stage_calls;
+                    audio_stage_calls = 0;
+                    for (int i = 0; i < 8; i++) {
+                        buf[1 + i] = audio_stage_cycles[i];
+                        audio_stage_cycles[i] = 0;
+                    }
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
                 case 0xEB: {  /* DEBUG (M9): read FPSCR. Bit 24 = FZ (Flush-to-Zero).
                                * If FZ is 0, denormals are slow-path emulated. */
                     uint32_t fpscr = __get_FPSCR();

@@ -113,6 +113,15 @@ DMA_HandleTypeDef hdma_sai4_b;
 volatile uint32_t audio_dma_callbacks = 0;
 volatile uint32_t audio_underruns      = 0;
 volatile uint32_t audio_fill_peak_cycles = 0;
+
+/* Per-stage cycle counters for diagnosing CPU anomalies. Each is an
+ * accumulator across fill_half calls; reset by the probe (vendor cmd
+ * 0xEC) so each read reports cycles-per-stage since the last read.
+ * Indexes match the stages defined just above the cycle-capture
+ * macros in fill_half. */
+#define STAGE_COUNT 8
+volatile uint32_t audio_stage_cycles[STAGE_COUNT];
+volatile uint32_t audio_stage_calls;     /* fill_half calls since last reset */
 /* CPU budget = cycles available per fill_half call. Exposed so the
  * servo-debug probe can convert peak cycles into a % of budget. */
 extern const uint32_t audio_fill_budget_cycles;
@@ -246,6 +255,18 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
      * CPU_METER_BLOCKS calls. Single MRC, ~1 cycle. */
     uint32_t cpu_t0 = DWT->CYCCNT;
 
+    /* Per-stage timing scaffolding. Each stage captures _ts at start,
+     * accumulates (CYCCNT - _ts) into audio_stage_cycles[stage_idx]
+     * at end. Macros keep the inline code tidy; total overhead per
+     * stage is ~4 cycles (two CYCCNT reads + subtraction + add). */
+    audio_stage_calls++;
+    uint32_t stage_ts = cpu_t0;
+    #define STAGE_END(idx) do { \
+        uint32_t now = DWT->CYCCNT; \
+        audio_stage_cycles[idx] += (now - stage_ts); \
+        stage_ts = now; \
+    } while (0)
+
     /* M9: source samples from the active input. SPDIF path drains
      * the SPDIFRX demux ring; USB path drains the UAC1 OUT ring. The
      * downstream DSP graph is identical either way — same int16
@@ -258,6 +279,7 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
         got = usb_ring_pop_frames(pop_scratch, AUDIO_FRAMES_HALF);
     }
     if (got < AUDIO_FRAMES_HALF) ++audio_underruns;
+    STAGE_END(0);   /* stage 0: input pop (USB ring or SPDIF resampler) */
 
     /* Snapshot the matrix crosspoints once per buffer-half (≪ 1 µs each)
      * so the inner loop stays branch-light. Per-input gain folds in
@@ -348,6 +370,8 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
         buf_r[i] = 0.0f;
     }
 
+    STAGE_END(1);   /* stage 1: preamp / matrix snapshot / param prep */
+
     /* === Stage 1.5: loudness compensation (volume-aware shelf cascade).
      *               Two SVF biquads per channel: low shelf (~50 Hz boost
      *               at low volumes) + high shelf (~10 kHz boost). Boost
@@ -388,12 +412,16 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
         }
     }
 
+    STAGE_END(2);   /* stage 2: loudness shelves */
+
     /* === Stage 2: per-input EQ (block-based — uses dsp_process_channel
      *               -block which is faster than per-sample dispatch). */
     if (!eq_bypass) {
         dsp_process_channel_block(filters[0], buf_l, AUDIO_FRAMES_HALF, 0);
         dsp_process_channel_block(filters[1], buf_r, AUDIO_FRAMES_HALF, 1);
     }
+
+    STAGE_END(3);   /* stage 3: per-input PEQ (channels 0, 1) */
 
     /* === Stage 3: crossfeed (per-sample API — fold into a tight loop). */
     if (cf_active) {
@@ -408,6 +436,8 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
                                (LevellerConfig *)&leveller_config,
                                buf_l, buf_r, AUDIO_FRAMES_HALF);
     }
+
+    STAGE_END(4);   /* stage 4: crossfeed + leveller */
 
     /* === Stage 5: matrix mixer → per-output buffers (8 outputs / 4
      * stereo slots). */
@@ -424,6 +454,8 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
         buf_o7[k] = il * g_l_to_o7 + ir * g_r_to_o7;
     }
 
+    STAGE_END(5);   /* stage 5: matrix mixer */
+
     /* === Stage 6: per-output EQ (block-based, channels 2..9). */
     if (!eq_bypass) {
         dsp_process_channel_block(filters[2], buf_o0, AUDIO_FRAMES_HALF, 2);
@@ -435,6 +467,8 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
         dsp_process_channel_block(filters[8], buf_o6, AUDIO_FRAMES_HALF, 8);
         dsp_process_channel_block(filters[9], buf_o7, AUDIO_FRAMES_HALF, 9);
     }
+
+    STAGE_END(6);   /* stage 6: per-output PEQ (channels 2..9) */
 
     /* === Stage 6.5: per-output delay (circular delay-line, mirrors RP
      *                ordering — runs AFTER per-output EQ but BEFORE the
@@ -552,6 +586,9 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
      * (≈ 7.8 s at 550 MHz — never going to happen). */
     static uint32_t cpu_cycle_acc   = 0;
     static uint16_t cpu_block_count = 0;
+    STAGE_END(7);   /* stage 7: delay + output gain + format convert */
+    #undef STAGE_END
+
     uint32_t cpu_delta = DWT->CYCCNT - cpu_t0;
     cpu_cycle_acc   += cpu_delta;
     cpu_block_count += 1;
@@ -565,12 +602,14 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
         audio_fill_peak_cycles = cpu_delta;
     }
     if (cpu_block_count >= CPU_METER_BLOCKS) {
-        /* avg cycles / call * 100 / budget = % load. Integer math:
-         *   load_pct = cpu_cycle_acc * 100 / (CPU_METER_BLOCKS * budget).
-         * Numerator fits in u32 because cpu_cycle_acc <= 128 * budget
-         * (= 128 * 2.2 M = 281 M, well under 2^32). */
-        uint32_t pct = (cpu_cycle_acc * 100U) /
-                       (CPU_METER_BLOCKS * CPU_BUDGET_CYCLES_PER_HALF);
+        /* avg cycles / call * 100 / budget = % load. The intermediate
+         * `cpu_cycle_acc * 100` overflows u32 once average-per-call
+         * cycles exceed ~336k (= 15% of the 2.2M-cycle budget). Without
+         * the uint64 promotion below the wrap produces nonsense
+         * percentages that move OPPOSITE to actual CPU. Promote and
+         * the math stays honest up to 100%. */
+        uint32_t pct = (uint32_t)(((uint64_t)cpu_cycle_acc * 100U) /
+                                  (CPU_METER_BLOCKS * CPU_BUDGET_CYCLES_PER_HALF));
         if (pct > 100U) pct = 100U;
         global_status.cpu0_load = (uint8_t)pct;
         cpu_cycle_acc   = 0;
