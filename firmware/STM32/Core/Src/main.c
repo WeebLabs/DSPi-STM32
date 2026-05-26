@@ -77,6 +77,17 @@ int main(void) {
      * buffer). */
     SCB_EnableICache();
 
+    /* Enable FPU Flush-To-Zero. Without this, denormal floats (any
+     * magnitude < ~1.18e-38) trigger software-emulated arithmetic on
+     * the M7 FPU — 10-100× slower than normal FP math. The DSP graph
+     * is full of feedback paths (biquad state, leveller envelope,
+     * crossfeed delay, resampler accumulator) that decay toward zero
+     * under silent input; without FTZ those states slip into denormal
+     * range and CPU spikes ~10× when no shaping is happening on the
+     * signal. With FTZ=1, denormal results are flushed to ±0 and the
+     * FPU stays in fast-path execution. FPSCR bit 24 = FZ. */
+    __set_FPSCR(__get_FPSCR() | (1U << 24));
+
     /* M7k: enable the DWT cycle counter. Used by audio_out.c's CPU
      * metering and any future cycle-accurate profiling. TRCENA gates the
      * entire DWT block; CYCCNTENA starts the counter ticking at SYSCLK.
@@ -152,8 +163,9 @@ int main(void) {
     printf("  HCLK      = %lu Hz\r\n", (unsigned long)HAL_RCC_GetHCLKFreq());
     printf("  HSE       = %lu Hz (board crystal)\r\n", (unsigned long)HSE_VALUE);
     printf("  USB FS    = PLL3Q -> 48 MHz (UAC1, VID 0x2E8B PID 0xFEAA)\r\n");
-    printf("  SAI kclk  = %lu Hz (PLL2_P)\r\n",
+    printf("  SAI kclk  = %lu Hz (PLL2_P, servo-tuned)\r\n",
            (unsigned long)HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SAI1));
+    printf("  SPDIFRX   = PLL3R -> 120 MHz (kclk, stable)\r\n");
     printf("  Audio out = SAI1_A I2S Philips 24-bit, MCLK PE2 / FS PE4 / SCK PE5 / SD PE6\r\n");
     printf("  Tone      = 48-sample sine -> 1.000 kHz at -12 dBFS\r\n");
     printf("  Heartbeat LED on PE3 (1 Hz idle / 4 Hz mounted / 10 Hz lost)\r\n");
@@ -349,24 +361,30 @@ static void SystemClock_Config(void) {
     periph.PLL2.PLL2N = 98;
     periph.PLL2.PLL2P = 10;       /* VCO 491.52 MHz / 10 → 49.15198 MHz (SAI kclk) */
     periph.PLL2.PLL2Q = 2;
-    /* M9: SPDIFRX peripheral kernel clock = PLL2_R. RM0468 §38 + AN5073
-     * specify a minimum SPDIFRX kernel clock of ~70.4 MHz (need enough
-     * over-sampling of the 6.144 MHz biphase rate at 48 kHz for the
-     * CDR to measure pulse widths accurately). 245 MHz (PLL2_R with
-     * R=2) was too fast and 61 MHz (R=8) was too slow. R=5 →
-     * 491.52/5 = 98.3 MHz lands in the middle of the documented
-     * 70.4 MHz–200 MHz working window. PLL2_P stays at 49.152 MHz
-     * via P=10, so SAI audio is unaffected. */
+    /* PLL2_R unused now that SPDIFRX moved to PLL3_R (see below). The
+     * value still has to be syntactically valid (R must be ≥ 1) but
+     * its output is not enabled. Keeping it at 5 to match the historic
+     * SPDIFRX-via-PLL2_R configuration in case we ever switch back. */
     periph.PLL2.PLL2R = 5;
     periph.PLL2.PLL2RGE    = RCC_PLL2VCIRANGE_2;   /* 4–8 MHz: 5 MHz fits */
     periph.PLL2.PLL2VCOSEL = RCC_PLL2VCOWIDE;      /* wide 192–836 MHz */
     periph.PLL2.PLL2FRACN  = 2490;                 /* −0.45 ppm vs 49.152 MHz */
 
-    /* PLL3 — USB FS @ exactly 48 MHz on PLL3Q.
+    /* PLL3 — USB FS @ 48 MHz on PLL3Q, AND SPDIFRX kernel clock @ 120 MHz
+     * on PLL3R. Both consumers want a rock-steady reference, and PLL3 is
+     * now never touched by the SPDIF rate servo (the servo lives on PLL2
+     * FRACN). Keeping the two on the same PLL is fine because neither
+     * needs ppm-level tuning — USB has its own protocol-level rate
+     * recovery, and SPDIFRX only uses kclk for CDR pulse-width thresholds
+     * (it doesn't need a frequency-locked relationship to the source).
+     *
      *   25 MHz / DIVM3=10 = 2.5 MHz VCO input (RGE_1: 2–4 MHz)
      *   2.5 MHz × 96 = 240 MHz VCO (WIDE: 192–836 MHz)
      *   240 / 5 = 48 MHz on PLL3Q  →  USBCLKSOURCE_PLL3
-     * Same recipe the H750 WeAct BSP uses on identical 25 MHz HSE. */
+     *   240 / 2 = 120 MHz on PLL3R →  SPDIFRXCLKSOURCE_PLL3
+     *
+     * 120 MHz lands cleanly in SPDIFRX's documented 70.4–200 MHz kclk
+     * working window. */
     periph.PLL3.PLL3M = 10;
     periph.PLL3.PLL3N = 96;
     periph.PLL3.PLL3P = 5;
@@ -381,13 +399,14 @@ static void SystemClock_Config(void) {
     periph.Sai1ClockSelection    = RCC_SAI1CLKSOURCE_PLL2;
     periph.Sai4AClockSelection   = RCC_SAI4ACLKSOURCE_PLL2;
     periph.Sai4BClockSelection   = RCC_SAI4BCLKSOURCE_PLL2;
-    /* M9: SPDIFRX kernel clock from PLL2_R (98.304 MHz). Same PLL as
-     * the SAI audio so a future audio-routed-loopback path stays
-     * frequency-locked end-to-end. The peripheral only uses this clock
-     * internally for CDR threshold comparisons + the WIDTH5 sample-
-     * rate measurement; keep it inside the documented 70.4-200 MHz
-     * SPDIFRX working window. */
-    periph.SpdifrxClockSelection = RCC_SPDIFRXCLKSOURCE_PLL2;
+    /* M9: SPDIFRX kernel clock from PLL3_R (120 MHz). Moved off PLL2_R
+     * because PLL2 FRACN is now servo-tuned by the SPDIF input rate
+     * tracker — every FRACN write briefly perturbs PLL2_R, which would
+     * disturb the SPDIFRX biphase decoder and cause spurious FERR /
+     * lock loss. PLL3 is never touched at runtime, so SPDIFRX gets an
+     * unperturbed kclk and stays locked even while PLL2_P is being
+     * slewed to track the source. */
+    periph.SpdifrxClockSelection = RCC_SPDIFRXCLKSOURCE_PLL3;
     if (HAL_RCCEx_PeriphCLKConfig(&periph) != HAL_OK) Error_Handler();
 }
 

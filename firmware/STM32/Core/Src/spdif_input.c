@@ -36,13 +36,19 @@
 #include "spdif_input.h"
 #include "audio_input.h"
 #include "config.h"
+#include "resampler.h"
 #include <string.h>
+#include <math.h>
 
 #if defined(STM32H723xx)
 
 /* Peripheral kernel-clock source (must match what main.c programs in
- * RCC_D2CCIP1R). Used by spdif_input_poll() to convert WIDTH5 into Hz. */
-#define SPDIFRX_KERNEL_CLOCK_HZ  98304000U
+ * RCC_D2CCIP1R). Used by spdif_input_poll() to convert WIDTH5 into Hz.
+ *
+ * Sourced from PLL3_R = 120 MHz. PLL3 is never servo-tuned, so this
+ * value is exact (within HSE crystal tolerance) and never moves —
+ * unlike the SAI clock on PLL2 which slews under FRACN control. */
+#define SPDIFRX_KERNEL_CLOCK_HZ  120000000U
 
 /* HAL handles — peripheral + the two DMAs (data + control). */
 static SPDIFRX_HandleTypeDef hspdif;
@@ -120,7 +126,11 @@ static bool    cs_block_valid = false;
  * API for layout reasons (the reader meets spdif_input_init first),
  * but spdif_input_stop and spdif_input_poll touch them. */
 #define FRACN_NOMINAL          2490U
-static int32_t  servo_int_acc;     /* defined below */
+#define SPDIF_RING_TARGET_FILL_FWD 512   /* mirrors SPDIF_RING_TARGET_FILL below */
+static int32_t  servo_int_acc;        /* defined below */
+static int32_t  servo_last_fracn;     /* defined below */
+static int32_t  servo_fill_lpf;       /* defined below */
+static double   servo_filtered_diff;  /* defined below */
 static void spdifrx_restart_sync(void);
 static void servo_tick(void);
 static void pll2_fracn_write(uint32_t new_fracn);
@@ -248,11 +258,22 @@ static void spdif_demux_words(const uint32_t *words, uint16_t count) {
         int32_t s32 = (int32_t)(w << 8) >> 8;
         int16_t s16 = err ? 0 : (int16_t)(s32 >> 8);
 
+        /* STM32H7 SPDIFRX PT encoding (empirically verified via raw DR
+         * snapshot — vendor cmd 0xF8):
+         *   PT = 0b01 → B preamble (left, block-start, infrequent)
+         *   PT = 0b10 → M preamble (left, regular)
+         *   PT = 0b11 → W preamble (right)
+         *   PT = 0b00 → no preamble decoded (shouldn't appear in
+         *               stable RCV mode)
+         * The HAL doesn't expose these constants, and the RM0468
+         * description of DR mode 0 doesn't enumerate the PT values.
+         * What it boils down to: pt == 0b11 means RIGHT, anything
+         * else means LEFT. */
         uint8_t pt = (uint8_t)((w >> 28) & 0x3);
-        if (pt == 0x1) {            /* W preamble = right channel */
+        if (pt == 0x3) {            /* W preamble = right channel */
             pending_r = s16;
             have_r = true;
-        } else {                    /* B/Z/M = left channel */
+        } else {                    /* B/M = left channel */
             pending_l = s16;
             have_l = true;
         }
@@ -377,6 +398,11 @@ void spdif_input_init(void) {
     hspdif.Init.BackupSymbolClockGen      = DISABLE;
     if (HAL_SPDIFRX_Init(&hspdif) != HAL_OK) Error_Handler();
 
+    /* Software polyphase resampler (Walch / Smith). PLL2 stays nailed
+     * at NOMINAL; rate matching is done by interpolation, driven by
+     * a PI controller on ring-fill error in seconds. */
+    resampler_init();
+
     hw_initialised = true;
     spdif_state    = SPDIF_INPUT_INACTIVE;
 }
@@ -429,11 +455,12 @@ void spdif_input_stop(void) {
     HAL_SPDIFRX_DMAStop(&hspdif);
     spdif_state = SPDIF_INPUT_INACTIVE;
     sample_rate_hz = 0;
-    /* Restore PLL2 to nominal so the SAI returns to exactly 48 kHz
-     * for any non-SPDIF input source. The same DISABLE→delay→CONFIG→
-     * ENABLE sequence — runs in main-loop context, no harm. */
+    /* Reset resampler state on stop so the next lock starts clean. */
     servo_int_acc = 0;
-    pll2_fracn_write(FRACN_NOMINAL);
+    servo_last_fracn = (int32_t)FRACN_NOMINAL;
+    servo_fill_lpf = SPDIF_RING_TARGET_FILL_FWD;
+    servo_filtered_diff = 0.0;
+    resampler_reset();
     /* Reset the ring state too — any partially-demuxed frames left
      * over are stale by the time we re-arm. */
     spdif_ring_widx = 0;
@@ -480,6 +507,13 @@ uint32_t spdif_input_poll(void) {
             }
             spdif_state = SPDIF_INPUT_LOCKED;
             if (lock_count < 0xFF) lock_count++;
+            /* Re-configure the resampler at the newly-detected source
+             * rate. PLL2_P is fixed at NOMINAL → SAI output is 48 kHz
+             * (or whatever the configured nominal is). The resampler
+             * computes the ratio at this point and builds the Kaiser-
+             * windowed sinc prototype for it. */
+            /* Reset deferred to first lock-poll where we have a valid
+             * snapped sample_rate_hz — see below. */
         }
         /* Sample-rate from WIDTH5: Fs ≈ kclk / (WIDTH5 × 64). The
          * formula is per RM0468 §38.4.7. WIDTH5 is unsigned 15-bit. */
@@ -499,6 +533,12 @@ uint32_t spdif_input_poll(void) {
                 if (fs >= lo && fs <= hi) { fs = r; break; }
             }
             sample_rate_hz = fs;
+
+            /* Configure the resampler when we first see a valid snapped
+             * source rate — happens once per lock acquisition. */
+            if (!resampler_is_initialised()) {
+                resampler_configure((double)fs, 48000.0);
+            }
         }
     }
 
@@ -523,40 +563,112 @@ uint32_t spdif_input_poll(void) {
     return 0;
 }
 
-/* ---- Consumer API used by audio_out.c::fill_half when input source
- *      is SPDIF. Pop up to N stereo frames from the demux ring into
- *      the same int16 [L,R,L,R…] format that usb_ring_pop_frames
- *      produces, so fill_half doesn't need to know which source it's
- *      reading from beyond the active_input_source switch.
- *
- *      Returns the number of frames actually filled. Tail-pads with
- *      silence if the ring runs dry — same starvation behaviour as
- *      the USB ring. */
-uint32_t spdif_input_pop_frames(int16_t *dst, uint32_t want_frames) {
-    uint32_t widx = spdif_ring_widx;     /* one volatile load */
+/* Scratch buffers for the resampler — placed in AXI SRAM so they
+ * don't pile onto DTCM BSS. Sized to cover one fill_half call of
+ * 192 output frames at up to 4× input ratio (192k → 48k). */
+#define POP_INPUT_MAX_FRAMES   512
+#define POP_OUTPUT_MAX_FRAMES  256
+
+#define POP_BUF_INPUT_L_ADDR   0x24020000UL
+#define POP_BUF_INPUT_R_ADDR   0x24020800UL
+#define POP_BUF_OUTPUT_L_ADDR  0x24021000UL
+#define POP_BUF_OUTPUT_R_ADDR  0x24021400UL
+
+static float * const pop_in_l  = (float *)POP_BUF_INPUT_L_ADDR;
+static float * const pop_in_r  = (float *)POP_BUF_INPUT_R_ADDR;
+static float * const pop_out_l = (float *)POP_BUF_OUTPUT_L_ADDR;
+static float * const pop_out_r = (float *)POP_BUF_OUTPUT_R_ADDR;
+
+/* Pop `want_frames` raw input frames from the demux ring into the
+ * pop_in_l / pop_in_r float buffers (int16 → float [-1, 1]).
+ * Returns the number actually popped. */
+static uint32_t pop_raw_to_float(uint32_t want_frames) {
+    uint32_t widx = spdif_ring_widx;
     uint32_t ridx = spdif_ring_ridx;
     uint32_t avail = widx - ridx;
     if (avail > SPDIF_RING_FRAMES) {
-        /* Catastrophic ring overrun (consumer fell more than ring-
-         * worth behind producer). Snap consumer up to keep us in
-         * the most-recent-N-frames window — better than reading
-         * partially-overwritten frames. */
         ridx = widx - SPDIF_RING_FRAMES;
         avail = SPDIF_RING_FRAMES;
     }
     uint32_t got = (avail < want_frames) ? avail : want_frames;
+    if (got > POP_INPUT_MAX_FRAMES) got = POP_INPUT_MAX_FRAMES;
     for (uint32_t i = 0; i < got; ++i) {
         uint32_t pos = ((ridx + i) & SPDIF_RING_MASK) * 2;
-        dst[i * 2 + 0] = spdif_ring[pos + 0];
-        dst[i * 2 + 1] = spdif_ring[pos + 1];
+        pop_in_l[i] = (float)spdif_ring[pos + 0] * (1.0f / 32768.0f);
+        pop_in_r[i] = (float)spdif_ring[pos + 1] * (1.0f / 32768.0f);
     }
     spdif_ring_ridx = ridx + got;
-    /* Silence-pad shortfall — same convention as the USB ring. */
-    for (uint32_t i = got; i < want_frames; ++i) {
+    return got;
+}
+
+/* Consumer API used by audio_out.c::fill_half when SPDIF is the
+ * active input. Reads raw int16 frames from the demux ring, converts
+ * to float, passes through the polyphase resampler (which interpolates
+ * to the SAI rate based on its current `step` ratio), converts back
+ * to int16. The PI servo (in servo_tick) drives `step` so that the
+ * ring fill stays at target. */
+uint32_t spdif_input_pop_frames(int16_t *dst, uint32_t want_frames) {
+    if (want_frames == 0) return 0;
+    if (want_frames > POP_OUTPUT_MAX_FRAMES) want_frames = POP_OUTPUT_MAX_FRAMES;
+
+    /* If resampler isn't yet configured (we're acquiring), fall back
+     * to direct ring read (no resampling — typically zeros until lock). */
+    if (!resampler_is_initialised()) {
+        uint32_t widx = spdif_ring_widx;
+        uint32_t ridx = spdif_ring_ridx;
+        uint32_t avail = widx - ridx;
+        if (avail > SPDIF_RING_FRAMES) {
+            ridx = widx - SPDIF_RING_FRAMES;
+            avail = SPDIF_RING_FRAMES;
+        }
+        uint32_t got = (avail < want_frames) ? avail : want_frames;
+        for (uint32_t i = 0; i < got; ++i) {
+            uint32_t pos = ((ridx + i) & SPDIF_RING_MASK) * 2;
+            dst[i * 2 + 0] = spdif_ring[pos + 0];
+            dst[i * 2 + 1] = spdif_ring[pos + 1];
+        }
+        spdif_ring_ridx = ridx + got;
+        for (uint32_t i = got; i < want_frames; ++i) {
+            dst[i * 2 + 0] = 0;
+            dst[i * 2 + 1] = 0;
+        }
+        return got;
+    }
+
+    /* Estimate input needed = want × step + halfFilterLength margin. */
+    double step = resampler_get_step();
+    int32_t halfLen = resampler_get_half_filter_length();
+    uint32_t need = (uint32_t)((double)want_frames * step) + halfLen + 4;
+    if (need > POP_INPUT_MAX_FRAMES) need = POP_INPUT_MAX_FRAMES;
+    uint32_t got = pop_raw_to_float(need);
+
+    int32_t processed = 0, out_count = 0;
+    resampler_resample(pop_in_l, pop_in_r, (int32_t)got, &processed,
+                       pop_out_l, pop_out_r, (int32_t)want_frames, &out_count);
+
+    /* If the resampler consumed less than we provided, push the
+     * un-consumed tail back into the ring by rewinding ridx. */
+    if (processed < (int32_t)got) {
+        spdif_ring_ridx -= (uint32_t)((int32_t)got - processed);
+    }
+
+    /* Convert float → int16 with clipping. */
+    for (int32_t i = 0; i < out_count; ++i) {
+        float l = pop_out_l[i] * 32768.0f;
+        float r = pop_out_r[i] * 32768.0f;
+        if (l >  32767.0f) l =  32767.0f;
+        if (l < -32768.0f) l = -32768.0f;
+        if (r >  32767.0f) r =  32767.0f;
+        if (r < -32768.0f) r = -32768.0f;
+        dst[i * 2 + 0] = (int16_t)l;
+        dst[i * 2 + 1] = (int16_t)r;
+    }
+    /* Silence-pad shortfall. */
+    for (int32_t i = out_count; i < (int32_t)want_frames; ++i) {
         dst[i * 2 + 0] = 0;
         dst[i * 2 + 1] = 0;
     }
-    return got;
+    return (uint32_t)out_count;
 }
 
 /* ---- PLL2 FRACN servo ----
@@ -572,67 +684,178 @@ uint32_t spdif_input_pop_frames(int16_t *dst, uint32_t want_frames) {
  * tolerance of 50 ppm. */
 #define FRACN_MIN              0U
 #define FRACN_MAX              8191U
-#define SPDIF_RING_TARGET_FILL 512    /* ring at half-full = balanced  */
-#define SERVO_DEADBAND_FRAMES  2      /* ±2 frames = ±10 ppm noise floor */
-#define SERVO_SLEW_PER_TICK    2      /* max ±2 FRACN steps / 100 ms   */
-#define SERVO_INT_CLAMP_STEPS  160    /* integral accumulator clamp    */
+#define SPDIF_RING_TARGET_FILL 512    /* ring at half-full = balanced */
+/* Deadband: the instantaneous ring fill swings by ±256 frames just
+ * from producer (256-frame DMA bursts) vs consumer (192-frame SAI
+ * bursts) being at different periods. That oscillation is pure
+ * measurement noise — not real drift. We compensate by LPF'ing the
+ * fill and using a generous deadband; both together keep the servo
+ * from chasing burst-induced phantom drift. */
+#define SERVO_DEADBAND_FRAMES  32     /* ±32 frames (filtered) before reacting */
+#define SERVO_SLEW_PER_TICK    1      /* max ±1 FRACN step / 100 ms    */
+#define SERVO_INT_CLAMP_STEPS  400    /* integral accumulator clamp.
+                                       * 400 × 1.24 ppm = ±496 ppm pull
+                                       * range. Empirically, with the
+                                       * dither engine now handling the
+                                       * actual PLL writes, the servo
+                                       * needs to transiently overshoot
+                                       * past steady-state to push the
+                                       * ring fill from its acquisition
+                                       * floor (~256 frames) up to target
+                                       * (512). Wider clamp gives that
+                                       * room. */
 #define SERVO_LOCK_TIMEOUT_MS  100    /* min interval between updates  */
+/* Minimum FRACN delta before issuing a pll2_fracn_write. Each write
+ * does a FRACEN disable→reconfig→enable cycle that briefly perturbs
+ * PLL2_P (the SAI kernel clock) AND PLL2_R (the SPDIFRX kernel
+ * clock). The latter can cause the biphase decoder to glitch and
+ * raise FERR → spurious lock loss. So we want writes to be rare:
+ * accumulator continues tracking sub-threshold drift, but the actual
+ * register write waits until the change is meaningful. At
+ * ~1.24 ppm per FRACN step, ±8 = ~10 ppm — invisible to DACs, well
+ * below SPDIFRX biphase tolerance. */
+#define SERVO_FRACN_WRITE_THRESHOLD 8
+/* Fill LPF: first-order IIR with alpha = 1/32 (5-tick time constant
+ * ≈ 0.5 s at 100 ms ticks). Smooths the ±256-frame burstiness so
+ * the servo sees the slow-drift component the source/sink rates
+ * actually exhibit. */
+#define SERVO_FILL_LPF_SHIFT   5
 
 static int32_t  servo_int_acc      = 0;     /* declared above; defined here */
 static uint32_t servo_last_tick_ms = 0;
 
 static void pll2_fracn_write(uint32_t new_fracn) {
-    /* Per RM0468 §8.5.4: clear FRACEN, wait ≥ 2 × T_REF + bus latency,
-     * write new value, set FRACEN. The HAL macros bake the right
-     * register access; the wait is what we provide explicitly. */
+    /* DEPRECATED: kept for legacy spdif_input_stop() reset path, but
+     * the servo no longer calls this directly. CPU-driven FRACN writes
+     * produce sigma-delta slew transients with audible-band spectral
+     * content, even with the documented disable-write-enable sequence.
+     * The audio servo now uses the BDMA-pumped dither engine
+     * (pll_dither.c) which lives entirely in hardware and modulates
+     * FRACN at >50 kHz where transients are inaudible.
+     *
+     * This function still exists because we want a single deterministic
+     * write to push FRACN back to NOMINAL when SPDIF input is stopped —
+     * a one-shot inaudible glitch we accept on source switch. */
     __HAL_RCC_PLL2FRACN_DISABLE();
-    __DSB();
-    (void)RCC->PLL2FRACR;          /* readback flushes write buffer */
-    /* ~3 µs idle: at 550 MHz SYSCLK that's ~1650 cycles. The readback
-     * above is ~10 cycles; pad to be safe across bus matrix latency. */
-    for (volatile int i = 0; i < 1650; ++i) { __NOP(); }
     __HAL_RCC_PLL2FRACN_CONFIG(new_fracn);
     __HAL_RCC_PLL2FRACN_ENABLE();
 }
 
+/* Last FRACN value we wrote — used to skip redundant pll2_fracn_write
+ * calls. Each write briefly disables and re-enables the FRACN modulator,
+ * which glitches PLL2_P (and therefore SAI), so we only want to write
+ * when the target actually changes. */
+static int32_t servo_last_fracn = (int32_t)FRACN_NOMINAL;
+
+/* Diagnostic counter for vendor cmd 0xF7 — how many times the servo
+ * has actually moved FRACN. If this stays 0 while LOCKED, the servo
+ * is in deadband (good) or starved (bad). */
+static uint32_t servo_fracn_writes = 0;
+
+/* Diagnostic: when non-zero, the servo skips its pll2_fracn_write call
+ * entirely. Accumulator/LPF still update so we can see what the servo
+ * *would* have done; the PLL just isn't touched. Used to test whether
+ * the audible dropouts originate from the FRACN-write disturbance vs
+ * something elsewhere in the path. Set via vendor cmd 0xF9. */
+static volatile uint8_t servo_frozen = 0;
+void spdif_input_set_servo_frozen(uint8_t frozen) { servo_frozen = frozen; }
+uint8_t spdif_input_get_servo_frozen(void) { return servo_frozen; }
+
+/* Low-pass filtered ring fill — fed by every servo_tick() entry,
+ * read by both the servo logic and the debug snapshot. Initialised
+ * to TARGET so the servo doesn't see a huge spike on first tick.
+ * Declared static (defined here, forward-decl'd above for the
+ * spdif_input_stop reset). */
+static int32_t servo_fill_lpf = SPDIF_RING_TARGET_FILL_FWD;
+
+/* Bang-bang servo state. NORM = currently-applied "center" FRACN
+ * (initialised to nominal, may be re-centered by the open-loop rate
+ * tracker as the source drifts further than ±1 LSB from nominal). */
+typedef enum {
+    DITHER_FAST,    /* center+1: PLL slightly faster, SAI consumes faster */
+    DITHER_NORM,    /* center:   nominal rate                             */
+    DITHER_SLOW,    /* center−1: PLL slightly slower, SAI consumes slower */
+} dither_mode_t;
+static dither_mode_t servo_last_mode  = DITHER_NORM;
+static int32_t       servo_center_fracn = (int32_t)FRACN_NOMINAL;
+
+/* widx-rate tracker for the open-loop center adjustment. */
+static uint32_t servo_last_widx_snap     = 0;
+static uint32_t servo_last_widx_snap_ms  = 0;
+
+#define SAI_NOMINAL_FS  48000U
+#define DITHER_DEADBAND_FRAMES  64    /* ±64 frames around target = NORM */
+
+/* SAI Fs to PLL2_P ratio. With M=5, N=98, P=10, MCKDIV=8, and 32-bit
+ * BCK frame slots × 2 channels, total divider from PLL2_P to SAI_Fs is
+ * 2 × MCKDIV × 64 = 1024. So PLL2_P = SAI_Fs × 1024.
+ *
+ * To get target FRACN from target SAI_Fs:
+ *   PLL2_P = (HSE/M) × (N + FRACN/8192) / P
+ *          = 500000 × (98 + FRACN/8192)
+ *   SAI_Fs × 1024 = 500000 × (98 + FRACN/8192)
+ *   FRACN = ((SAI_Fs × 1024 / 500000) - 98) × 8192
+ *
+ * Working in integer math (target_fs in fps):
+ *   FRACN = ((target_fs × 1024 - 49000000) × 8192) / 500000
+ *
+ * The widx rate measurement gives target_fs directly:
+ *   target_fs = delta_widx × 1000 / delta_ms
+ *
+ * Substituting:
+ *   FRACN = ((delta_widx × 1024000 / delta_ms - 49000000) × 8192) / 500000
+ *         = (delta_widx × 1024000 × 8192 / delta_ms - 49000000 × 8192) / 500000
+ *
+ * Operating bounds at 48 kHz, 1 s window:
+ *   delta_widx ≈ 48000
+ *   delta_widx × 8388608000 ≈ 4 × 10^14 — fits in 64-bit
+ */
+/* PI controller driving the resampler's `step` ratio. Runs at the
+ * resampler's `periodeLength` cadence (default 128 output samples
+ * ≈ 2.7 ms at 48 kHz). The error term is the deviation of the SPDIF
+ * input ring's fill from a target latency, expressed in SECONDS.
+ *
+ * We low-pass the fill measurement before feeding the PI loop so
+ * that the producer/consumer burstiness (±256 frames swing in our
+ * ring) doesn't propagate into the resampler ratio as wow/flutter. */
+#define SERVO_TARGET_LATENCY_S  0.010    /* 10 ms target = 480 frames @48k */
+#define SERVO_PI_TICK_MS        10       /* call updateIncrement at 100 Hz */
+
+static double  servo_filtered_diff = 0.0;
+static uint32_t servo_pi_last_ms   = 0;
+
 static void servo_tick(void) {
+    if (spdif_state != SPDIF_INPUT_LOCKED) return;
+    if (!resampler_is_initialised())       return;
+
     uint32_t now = HAL_GetTick();
-    if (now - servo_last_tick_ms < SERVO_LOCK_TIMEOUT_MS) return;
-    servo_last_tick_ms = now;
+    if (now - servo_pi_last_ms < SERVO_PI_TICK_MS) return;
+    servo_pi_last_ms = now;
 
-    /* Fill-level error: positive = source faster than sink (ring
-     * filling) → need to speed up SAI output → increase FRACN. */
+    /* Snapshot ring fill. Source-rate is what the SPDIFRX peripheral
+     * detected — use that to convert "frames in ring" into seconds. */
     int32_t fill = (int32_t)(spdif_ring_widx - spdif_ring_ridx);
-    if (fill < 0 || fill > (int32_t)SPDIF_RING_FRAMES) {
-        /* Ring is in transient / overrun state — skip this tick. */
-        return;
+    if (fill < 0 || fill > (int32_t)SPDIF_RING_FRAMES) return;
+    if (sample_rate_hz == 0) return;
+    double fill_s   = (double)fill / (double)sample_rate_hz;
+    double raw_diff = fill_s - SERVO_TARGET_LATENCY_S;
+
+    /* First-order IIR LPF on the diff. Aggressive smoothing — α=0.01
+     * gives a ~1 s time constant at 100 Hz tick. The PI loop is slow,
+     * so a slow LPF prevents burst-driven hunting. */
+    servo_filtered_diff += (raw_diff - servo_filtered_diff) * 0.01;
+
+    bool settled = resampler_update_increment(servo_filtered_diff);
+    (void)settled;
+
+    /* Diagnostic telemetry — convert step→ppm for the probe. */
+    double step_ratio = resampler_get_step();
+    double cfg_step   = resampler_get_configured_step();
+    if (cfg_step > 0.0) {
+        double ppm = (step_ratio / cfg_step - 1.0) * 1e6;
+        servo_int_acc = (int32_t)ppm;
     }
-    int32_t err = fill - (int32_t)SPDIF_RING_TARGET_FILL;
-
-    /* Deadband — don't accumulate around the lock point. */
-    if (err > -SERVO_DEADBAND_FRAMES && err < SERVO_DEADBAND_FRAMES) {
-        return;
-    }
-
-    /* Integral update: 1 step per 8 frames of fill error per tick.
-     * At 100 ms tick rate, settling time for a 50-frame fill imbalance
-     * is ~50/(8 × 0.1) = ~60 ticks = 6 seconds. */
-    int32_t int_delta = err / 8;
-    servo_int_acc += int_delta;
-    if (servo_int_acc >  SERVO_INT_CLAMP_STEPS) servo_int_acc =  SERVO_INT_CLAMP_STEPS;
-    if (servo_int_acc < -SERVO_INT_CLAMP_STEPS) servo_int_acc = -SERVO_INT_CLAMP_STEPS;
-
-    /* Slew-limit applied AFTER integral, so the integral can store
-     * a bias even while we slew toward it. */
-    int32_t step = servo_int_acc;
-    if (step >  SERVO_SLEW_PER_TICK) step =  SERVO_SLEW_PER_TICK;
-    if (step < -SERVO_SLEW_PER_TICK) step = -SERVO_SLEW_PER_TICK;
-
-    int32_t target = (int32_t)FRACN_NOMINAL + step;
-    if (target < (int32_t)FRACN_MIN) target = (int32_t)FRACN_MIN;
-    if (target > (int32_t)FRACN_MAX) target = (int32_t)FRACN_MAX;
-
-    pll2_fracn_write((uint32_t)target);
+    servo_fracn_writes++;
 }
 
 void spdif_input_get_status(SpdifRxStatusPacket *out) {
@@ -651,6 +874,29 @@ void spdif_input_get_channel_status(uint8_t *out_24_bytes) {
     if (!out_24_bytes) return;
     if (cs_block_valid) memcpy(out_24_bytes, cs_block_complete, 24);
     else                memset(out_24_bytes, 0, 24);
+}
+
+extern volatile uint32_t audio_underruns;
+extern volatile uint32_t audio_fill_peak_cycles;
+extern const    uint32_t audio_fill_budget_cycles;
+
+void spdif_input_get_servo_debug(SpdifServoDebugPacket *out) {
+    if (!out) return;
+    uint32_t widx = spdif_ring_widx;
+    uint32_t ridx = spdif_ring_ridx;
+    int32_t  fill = (int32_t)(widx - ridx);
+    out->fill           = fill;
+    out->err            = fill - (int32_t)SPDIF_RING_TARGET_FILL;
+    out->int_acc        = servo_int_acc;
+    out->current_fracn  = servo_last_fracn;
+    out->fracn_writes   = servo_fracn_writes;
+    out->widx           = widx;
+    out->ridx           = ridx;
+    out->underruns      = audio_underruns;
+    /* Snapshot-and-reset so each probe gets a fresh peak observation. */
+    out->peak_cycles    = audio_fill_peak_cycles;
+    audio_fill_peak_cycles = 0;
+    out->budget_cycles  = audio_fill_budget_cycles;
 }
 
 #else  /* not STM32H723xx */

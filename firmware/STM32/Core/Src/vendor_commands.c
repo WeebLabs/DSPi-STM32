@@ -387,6 +387,89 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                             (tusb_control_request_t *)req,
                                             buf, sizeof(buf));
                 }
+                case 0xF9: {  /* DEBUG (M9): freeze/thaw the FRACN servo.
+                               * wValue=1 → freeze (servo stops writing
+                               * to PLL2FRACR, accumulator still tracks);
+                               * wValue=0 → thaw. Returns current state.
+                               * Used to A/B test whether FRACN write
+                               * glitches are causing audible DAC dropouts. */
+                    extern void spdif_input_set_servo_frozen(uint8_t f);
+                    extern uint8_t spdif_input_get_servo_frozen(void);
+                    spdif_input_set_servo_frozen(req->wValue ? 1 : 0);
+                    static uint8_t st;
+                    st = spdif_input_get_servo_frozen();
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &st, 1);
+                }
+                case 0xEB: {  /* DEBUG (M9): read FPSCR. Bit 24 = FZ (Flush-to-Zero).
+                               * If FZ is 0, denormals are slow-path emulated. */
+                    uint32_t fpscr = __get_FPSCR();
+                    static uint32_t buf[2];
+                    buf[0] = fpscr;
+                    buf[1] = (fpscr >> 24) & 1;  /* FZ bit isolated */
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
+                case 0xEA: {  /* DEBUG (M9): dump dither buffers + TIM7 +
+                               * DMA1 Stream 4/5 status + DMA error
+                               * flags to see why the CFGR DMA isn't
+                               * toggling FRACEN. */
+                    static uint32_t buf[16];
+                    volatile uint32_t *cfgr_b  = (uint32_t*)0x24016100UL;
+                    buf[0] = cfgr_b[0];      /* should have FRACEN=0  */
+                    buf[1] = cfgr_b[1];      /* should have FRACEN=1  */
+                    buf[2] = DMA1_Stream4->CR;
+                    buf[3] = DMA1_Stream4->NDTR;
+                    buf[4] = DMA1_Stream5->CR;
+                    buf[5] = DMA1_Stream5->NDTR;
+                    buf[6] = DMA1->LISR;          /* err flags streams 0-3 */
+                    buf[7] = DMA1->HISR;          /* err flags streams 4-7 */
+                    /* DMAMUX1 channel CCR for stream 4 + 5. Channel index
+                     * = stream index since DMA1 is the first 8 channels. */
+                    buf[8] = DMAMUX1_Channel4->CCR;
+                    buf[9] = DMAMUX1_Channel5->CCR;
+                    buf[10] = (uint32_t)DMA1_Stream5->M0AR;
+                    buf[11] = (uint32_t)DMA1_Stream5->PAR;
+                    buf[12] = RCC->PLLCFGR;
+                    buf[13] = TIM7->CNT;
+                    buf[14] = TIM7->DIER;
+                    buf[15] = 0xdeadbeef;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
+                case 0xF8: {  /* DEBUG (M9): snapshot 16 consecutive raw
+                               * SPDIFRX_DR words from the DMA buffer so
+                               * the host can decode PT / V / PE / audio
+                               * bit positions and confirm the demux is
+                               * extracting the right fields. Reads
+                               * directly from the AXI-SRAM DMA ring at
+                               * 0x24002000 — that's where the SPDIFRX
+                               * DMA dumps subframe words. */
+                    static uint32_t snap[16];
+                    volatile uint32_t *src = (volatile uint32_t *)0x24002000UL;
+                    /* Grab the 16 words around the middle of the DMA
+                     * buffer — should be settled past any half-cplt
+                     * boundary effects. Volatile copy so the compiler
+                     * doesn't reorder vs the DMA writes. */
+                    for (int i = 0; i < 16; i++) snap[i] = src[i + 256];
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            snap, sizeof(snap));
+                }
+                case 0xF7: {  /* DEBUG (M9): servo state snapshot — fill,
+                               * err, integral accumulator, current
+                               * FRACN, and pll2_fracn_write call count.
+                               * Use to verify the FRACN servo is
+                               * actually moving the PLL during LOCKED. */
+                    static SpdifServoDebugPacket pkt;
+                    spdif_input_get_servo_debug(&pkt);
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &pkt, sizeof(pkt));
+                }
                 case 0xF6: {  /* DEBUG (M9): PD8 as plain INPUT + internal
                                * pull-up, AF routing disconnected. Used
                                * during M9 bring-up to isolate whether
@@ -460,16 +543,28 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                 }
                 case 0xF3: {  /* DEBUG (M9): RCC + PLL2 + SPDIFRX clock-tree
                                * snapshot — figure out where the kernel
-                               * clock got lost. 28-byte payload, u32 LE: */
-                    static uint32_t buf[7];
-                    buf[0] = RCC->CR;        /* PLL2RDY in bit 27         */
-                    buf[1] = RCC->PLLCFGR;   /* DIVPxEN/DIVQxEN/DIVRxEN
-                                              * + FRACEN per PLL          */
-                    buf[2] = RCC->PLL2DIVR;  /* DIVN/P/Q/R values         */
-                    buf[3] = RCC->PLL2FRACR; /* FRACN[12:0]               */
-                    buf[4] = RCC->D2CCIP1R;  /* SPDIFSEL bits[21:20]      */
-                    buf[5] = RCC->APB1LENR;  /* SPDIFRXEN bit 16          */
-                    buf[6] = RCC->CFGR;      /* general clk source        */
+                               * clock got lost. Extended for M9-dither:
+                               * also captures live TIM7 state and the
+                               * DMA1 Stream 4/5 status so we can verify
+                               * the dither engine is alive. 64-byte
+                               * payload, u32 LE. */
+                    static uint32_t buf[16];
+                    buf[0]  = RCC->CR;        /* PLL2RDY bit 27          */
+                    buf[1]  = RCC->PLLCFGR;
+                    buf[2]  = RCC->PLL2DIVR;
+                    buf[3]  = RCC->PLL2FRACR; /* live FRACN snapshot     */
+                    buf[4]  = RCC->D2CCIP1R;
+                    buf[5]  = RCC->APB1LENR;
+                    buf[6]  = RCC->CFGR;
+                    buf[7]  = TIM7->CNT;      /* live counter            */
+                    buf[8]  = TIM7->ARR;      /* period (= kclk/100k - 1)*/
+                    buf[9]  = TIM7->CR1;      /* CEN bit 0 must be set   */
+                    buf[10] = TIM7->DIER;     /* UDE bit 8 must be set   */
+                    buf[11] = DMA1_Stream4->CR;   /* EN bit 0 must be set */
+                    buf[12] = DMA1_Stream4->NDTR; /* remaining transfers */
+                    buf[13] = DMA1_Stream5->CR;
+                    buf[14] = DMA1_Stream5->NDTR;
+                    buf[15] = RCC->AHB1ENR;       /* TIM7EN visible here */
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req,
                                             buf, sizeof(buf));

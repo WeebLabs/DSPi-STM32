@@ -20,6 +20,8 @@ extern "C" {
 #define HAL_SPI_MODULE_ENABLED          /* M11: SPI3 -> W25Q64 preset flash */
 #define HAL_CORTEX_MODULE_ENABLED
 #define HAL_DMA_MODULE_ENABLED
+#define HAL_TIM_MODULE_ENABLED          /* M9: TIM7 drives FRACN dither DMA */
+#define HAL_LPTIM_MODULE_ENABLED        /* M9: LPTIM3 drives BDMA FRACEN toggle */
 /* HAL_FLASH stays enabled (HAL_RCC_ClockConfig needs FLASH_LATENCY_4 +
  * __HAL_FLASH_GET_LATENCY). flash_clkdiv.h #undefs FLASH_SECTOR_SIZE /
  * FLASH_PAGE_SIZE before redefining them — the HAL macros for H7
@@ -117,6 +119,12 @@ extern "C" {
 #endif
 #ifdef HAL_SPI_MODULE_ENABLED
   #include "stm32h7xx_hal_spi.h"
+#endif
+#ifdef HAL_TIM_MODULE_ENABLED
+  #include "stm32h7xx_hal_tim.h"
+#endif
+#ifdef HAL_LPTIM_MODULE_ENABLED
+  #include "stm32h7xx_hal_lptim.h"
 #endif
 
 #ifdef USE_FULL_ASSERT

@@ -77,4 +77,24 @@ void spdif_input_get_status(SpdifRxStatusPacket *out);
  * for vendor cmd 0xE3. Returns zeros if no block has been received. */
 void spdif_input_get_channel_status(uint8_t *out_24_bytes);
 
+/* Debug: snapshot of current servo state. fill = ring write-head minus
+ * read-head; err = fill - target; int_acc = integral accumulator
+ * (== current FRACN offset from nominal); fracn = last FRACN value
+ * actually written. All values are point-in-time and may race the
+ * servo by one tick — that's fine for a diagnostic. */
+typedef struct __attribute__((packed)) {
+    int32_t  fill;            /* current ring fill in stereo frames     */
+    int32_t  err;             /* fill - SPDIF_RING_TARGET_FILL          */
+    int32_t  int_acc;         /* servo_int_acc                          */
+    int32_t  current_fracn;   /* servo_last_fracn (signed for clarity)  */
+    uint32_t fracn_writes;    /* count of pll2_fracn_write calls        */
+    uint32_t widx;            /* spdif_ring_widx (raw monotonic)        */
+    uint32_t ridx;            /* spdif_ring_ridx (raw monotonic)        */
+    uint32_t underruns;       /* cumulative fill_half short-pop count   */
+    uint32_t peak_cycles;     /* worst fill_half cycle count (rolling)  */
+    uint32_t budget_cycles;   /* fill_half budget = 4 ms × SYSCLK       */
+} SpdifServoDebugPacket;
+
+void spdif_input_get_servo_debug(SpdifServoDebugPacket *out);
+
 #endif /* SPDIF_INPUT_H */

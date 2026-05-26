@@ -21,7 +21,7 @@ project(DSPi_stm32h723 C ASM)
 find_package(CMSIS COMPONENTS STM32H723VG_M7 REQUIRED)
 find_package(HAL   COMPONENTS STM32H7_M7
                               RCC GPIO CORTEX PWR FLASH UART DMA SAI SPDIFRX
-                              ADC SPI
+                              ADC SPI TIM LPTIM
                    REQUIRED)
 
 set(EXE DSPi_stm32h723)
@@ -32,6 +32,11 @@ set(EXE DSPi_stm32h723)
 set(TINYUSB_DIR ${CMAKE_CURRENT_LIST_DIR}/../pico-sdk/lib/tinyusb)
 
 add_executable(${EXE}
+    # M9: DMAEx HAL — needed for HAL_DMAEx_ConfigMuxRequestGenerator
+    # used by the BDMA-pumped FRACN dither engine. stm32-cmake's
+    # FindHAL doesn't auto-include the *_ex.c sources for H7, so pull
+    # this one in explicitly.
+    ${CMAKE_CURRENT_LIST_DIR}/../../vendor/STM32CubeH7/Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_dma_ex.c
     Core/Src/main.c
     Core/Src/stm32h7xx_it.c
     Core/Src/stm32h7xx_hal_msp.c
@@ -51,6 +56,7 @@ add_executable(${EXE}
     Core/Src/audio_state.c
     Core/Src/audio_input.c
     Core/Src/spdif_input.c
+    Core/Src/resampler.c      # M9: polyphase windowed-sinc SPDIF→SAI resampler
     Core/Src/bulk_params.c
     Core/Src/notify.c
     Core/Src/crossfeed.c
@@ -107,6 +113,9 @@ target_link_libraries(${EXE} PRIVATE
     HAL::STM32::H7::M7::ADCEx
     HAL::STM32::H7::M7::SPI      # M11 — W25Q64 on SPI3
     HAL::STM32::H7::M7::SPIEx
+    HAL::STM32::H7::M7::TIM      # M9 — TIM7 drives FRACN dither DMA
+    HAL::STM32::H7::M7::TIMEx
+    HAL::STM32::H7::M7::LPTIM    # M9 — LPTIM3 drives BDMA FRACEN toggle
     CMSIS::STM32::H723VG::M7
     STM32::NoSys
 )

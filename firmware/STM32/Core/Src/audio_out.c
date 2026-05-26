@@ -111,7 +111,11 @@ DMA_HandleTypeDef hdma_sai4_a;      /* DMA_HandleTypeDef shared between
 DMA_HandleTypeDef hdma_sai4_b;
 
 volatile uint32_t audio_dma_callbacks = 0;
-volatile uint32_t audio_underruns     = 0;
+volatile uint32_t audio_underruns      = 0;
+volatile uint32_t audio_fill_peak_cycles = 0;
+/* CPU budget = cycles available per fill_half call. Exposed so the
+ * servo-debug probe can convert peak cycles into a % of budget. */
+extern const uint32_t audio_fill_budget_cycles;
 
 /* ---------------------------------------------------------------------- */
 /* DMA half-buffer fill — drain USB ring, convert 16-bit → 24-bit         */
@@ -180,6 +184,10 @@ extern volatile SystemStatusPacket global_status;
 #define CPU_METER_BLOCKS         128U  /* ~0.5 s at 192 frames / 48 kHz */
 #define CPU_BUDGET_CYCLES_PER_HALF \
         ((uint32_t)((uint64_t)550000000U * AUDIO_FRAMES_HALF / 48000U))
+
+/* Defined here for reference by the M9 servo-debug probe (vendor 0xF7),
+ * so the probe can show "peak cycles / budget = % budget consumed". */
+const uint32_t audio_fill_budget_cycles = CPU_BUDGET_CYCLES_PER_HALF;
 
 /* M7i: loudness compensation — per-channel SVF state for the 2-biquad
  * shelf cascade. State lives here (not in loudness.c) because it's a
@@ -544,8 +552,18 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
      * (≈ 7.8 s at 550 MHz — never going to happen). */
     static uint32_t cpu_cycle_acc   = 0;
     static uint16_t cpu_block_count = 0;
-    cpu_cycle_acc   += DWT->CYCCNT - cpu_t0;
+    uint32_t cpu_delta = DWT->CYCCNT - cpu_t0;
+    cpu_cycle_acc   += cpu_delta;
     cpu_block_count += 1;
+    /* Track peak cycles per fill_half across the whole CPU-meter window
+     * so we can spot spikes that exceed the 4 ms budget even when the
+     * average load looks fine. Exposed via vendor cmd 0xF7 (servo debug
+     * packet). Reset to 0 at the end of each averaging window so each
+     * report covers a fresh ~0.5 s slice. */
+    extern volatile uint32_t audio_fill_peak_cycles;
+    if (cpu_delta > audio_fill_peak_cycles) {
+        audio_fill_peak_cycles = cpu_delta;
+    }
     if (cpu_block_count >= CPU_METER_BLOCKS) {
         /* avg cycles / call * 100 / budget = % load. Integer math:
          *   load_pct = cpu_cycle_acc * 100 / (CPU_METER_BLOCKS * budget).
