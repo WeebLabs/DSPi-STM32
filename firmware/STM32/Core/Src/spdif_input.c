@@ -83,6 +83,14 @@ static DMA_HandleTypeDef     hdma_spdifrx_cs;   /* channel/user, request 94 */
 static uint32_t * const spdifrx_dt_buf = (uint32_t *)SPDIFRX_DT_BUF_BASE;
 static uint32_t * const spdifrx_cs_buf = (uint32_t *)SPDIFRX_CS_BUF_BASE;
 
+/* DEBUG (M9) — source-switch silent-failure tracking. */
+volatile uint32_t spdif_start_call_count       = 0;
+volatile uint32_t spdif_start_dt_rc            = 0xFFFFFFFF;
+volatile uint32_t spdif_start_cs_rc            = 0xFFFFFFFF;
+volatile uint32_t spdif_start_pre_hspdif_state = 0;
+volatile uint32_t spdif_start_dt_dma_state     = 0;
+volatile uint32_t spdif_start_pre_cr           = 0;
+
 /* Run-time state. */
 static volatile SpdifInputState spdif_state    = SPDIF_INPUT_INACTIVE;
 static volatile uint8_t         lock_count     = 0;
@@ -422,6 +430,20 @@ void spdif_input_start(void) {
 
     spdif_state = SPDIF_INPUT_ACQUIRING;
 
+    /* DEBUG (M9): capture the HAL result + DMA EN bit + hspdif state
+     * for the source-switch silent-failure bug. Volatile so the probe
+     * (vendor 0xED) can read while audio path is hot. */
+    extern volatile uint32_t spdif_start_call_count;
+    extern volatile uint32_t spdif_start_dt_rc;
+    extern volatile uint32_t spdif_start_cs_rc;
+    extern volatile uint32_t spdif_start_pre_hspdif_state;
+    extern volatile uint32_t spdif_start_dt_dma_state;
+    extern volatile uint32_t spdif_start_pre_cr;
+    spdif_start_call_count++;
+    spdif_start_pre_hspdif_state = hspdif.State;
+    spdif_start_dt_dma_state = hdma_spdifrx_dt.State;
+    spdif_start_pre_cr = (uint32_t)(DMA1_Stream2->CR & 0xFFFF);
+
     /* HAL_SPDIFRX_ReceiveDataFlow_DMA does the DR DMA arming + sets
      * SPDIFEN=01 (SYNC mode) + polls SR.SYNCD for ~3 ms via a count-
      * down loop. With no signal connected the poll times out and HAL
@@ -433,6 +455,7 @@ void spdif_input_start(void) {
     HAL_StatusTypeDef rc = HAL_SPDIFRX_ReceiveDataFlow_DMA(&hspdif,
                                                           spdifrx_dt_buf,
                                                           SPDIFRX_DT_BUF_WORDS);
+    spdif_start_dt_rc = (uint32_t)rc;
     if (rc != HAL_OK && rc != HAL_TIMEOUT) {
         spdif_state = SPDIF_INPUT_INACTIVE;
         return;
@@ -443,6 +466,7 @@ void spdif_input_start(void) {
      * state — same timeout semantics, same forgiveness. */
     rc = HAL_SPDIFRX_ReceiveCtrlFlow_DMA(&hspdif, spdifrx_cs_buf,
                                          SPDIFRX_CS_BUF_WORDS);
+    spdif_start_cs_rc = (uint32_t)rc;
     if (rc != HAL_OK && rc != HAL_TIMEOUT) {
         /* CSR failure isn't fatal — we can still receive audio,
          * we just won't track channel status. Leave state at
@@ -452,7 +476,31 @@ void spdif_input_start(void) {
 
 void spdif_input_stop(void) {
     if (spdif_state == SPDIF_INPUT_INACTIVE) return;
+    /* HAL_SPDIFRX_DMAStop writes EN=0 and returns — it does NOT wait
+     * for the DMA streams to actually disable. On a fast restart
+     * (USB→SPDIF→USB→SPDIF) the next HAL_DMA_Start_IT can see EN still
+     * set and return HAL_BUSY, which our start() interprets as a hard
+     * failure (silently re-INACTIVE → source switch ignored).
+     *
+     * HAL_DMA_Abort polls EN with a 5 ms timeout. The SPDIFRX peripheral
+     * sometimes holds the DMA's request line long enough that the abort
+     * times out and leaves hdma->State = HAL_DMA_STATE_TIMEOUT, even
+     * though EN actually does clear shortly after. State=TIMEOUT then
+     * makes the next HAL_DMA_Start_IT reject.
+     *
+     * Belt-and-braces: call Abort (best-effort), then DMAStop, then
+     * explicitly force the DMA handle state back to READY so the next
+     * start succeeds regardless of how the abort wait went. The
+     * hardware EN bit is already cleared by both abort and stop. */
+    HAL_DMA_Abort(&hdma_spdifrx_dt);
+    HAL_DMA_Abort(&hdma_spdifrx_cs);
     HAL_SPDIFRX_DMAStop(&hspdif);
+    hdma_spdifrx_dt.State = HAL_DMA_STATE_READY;
+    hdma_spdifrx_dt.ErrorCode = HAL_DMA_ERROR_NONE;
+    hdma_spdifrx_cs.State = HAL_DMA_STATE_READY;
+    hdma_spdifrx_cs.ErrorCode = HAL_DMA_ERROR_NONE;
+    hspdif.State = HAL_SPDIFRX_STATE_READY;
+    hspdif.ErrorCode = HAL_SPDIFRX_ERROR_NONE;
     spdif_state = SPDIF_INPUT_INACTIVE;
     sample_rate_hz = 0;
     /* Reset resampler state on stop so the next lock starts clean. */

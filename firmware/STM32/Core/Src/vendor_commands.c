@@ -402,6 +402,26 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                             (tusb_control_request_t *)req,
                                             &st, 1);
                 }
+                case 0xED: {  /* DEBUG (M9): SPDIF source-switch start state.
+                               * Snapshot of conditions just before the
+                               * last HAL_SPDIFRX_ReceiveDataFlow_DMA call. */
+                    extern volatile uint32_t spdif_start_call_count;
+                    extern volatile uint32_t spdif_start_dt_rc;
+                    extern volatile uint32_t spdif_start_cs_rc;
+                    extern volatile uint32_t spdif_start_pre_hspdif_state;
+                    extern volatile uint32_t spdif_start_dt_dma_state;
+                    extern volatile uint32_t spdif_start_pre_cr;
+                    static uint32_t buf[6];
+                    buf[0] = spdif_start_call_count;
+                    buf[1] = spdif_start_dt_rc;
+                    buf[2] = spdif_start_cs_rc;
+                    buf[3] = spdif_start_pre_hspdif_state;
+                    buf[4] = spdif_start_dt_dma_state;
+                    buf[5] = spdif_start_pre_cr;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            buf, sizeof(buf));
+                }
                 case 0xEC: {  /* DEBUG (M9): per-stage cycle counters from
                                * fill_half. Returns 9 u32: count of
                                * fill_half calls since last read, then 8
