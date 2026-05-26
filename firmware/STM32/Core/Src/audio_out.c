@@ -118,7 +118,13 @@ volatile uint32_t audio_fill_peak_cycles = 0;
  * accumulator across fill_half calls; reset by the probe (vendor cmd
  * 0xEC) so each read reports cycles-per-stage since the last read.
  * Indexes match the stages defined just above the cycle-capture
- * macros in fill_half. */
+ * macros in fill_half.
+ *
+ * Gated by DSPI_AUDIO_STAGE_PROFILING (cmake option, default OFF) —
+ * the per-stage timing macros each cost ~4 cycles and 8 of them × 250
+ * fill_half/sec totals ~0.4% CPU overhead. The symbols still exist
+ * either way so vendor cmd 0xEC compiles cleanly; values just stay
+ * zero when profiling is disabled. */
 #define STAGE_COUNT 8
 volatile uint32_t audio_stage_cycles[STAGE_COUNT];
 volatile uint32_t audio_stage_calls;     /* fill_half calls since last reset */
@@ -255,10 +261,12 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
      * CPU_METER_BLOCKS calls. Single MRC, ~1 cycle. */
     uint32_t cpu_t0 = DWT->CYCCNT;
 
-    /* Per-stage timing scaffolding. Each stage captures _ts at start,
-     * accumulates (CYCCNT - _ts) into audio_stage_cycles[stage_idx]
-     * at end. Macros keep the inline code tidy; total overhead per
-     * stage is ~4 cycles (two CYCCNT reads + subtraction + add). */
+    /* Per-stage timing scaffolding — gated by DSPI_AUDIO_STAGE_PROFILING.
+     * When enabled each stage captures CYCCNT at the boundary and
+     * accumulates (now - prev) into audio_stage_cycles[stage_idx].
+     * When disabled the macro expands to nothing and the compiler
+     * elides the dead stage_ts updates. */
+#ifdef DSPI_AUDIO_STAGE_PROFILING
     audio_stage_calls++;
     uint32_t stage_ts = cpu_t0;
     #define STAGE_END(idx) do { \
@@ -266,6 +274,9 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
         audio_stage_cycles[idx] += (now - stage_ts); \
         stage_ts = now; \
     } while (0)
+#else
+    #define STAGE_END(idx) do {} while (0)
+#endif
 
     /* M9: source samples from the active input. SPDIF path drains
      * the SPDIFRX demux ring; USB path drains the UAC1 OUT ring. The

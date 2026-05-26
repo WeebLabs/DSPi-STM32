@@ -90,6 +90,18 @@ target_compile_definitions(${EXE} PRIVATE
     DSPI_STM32_NO_TIME_CRITICAL_SECTION
 )
 
+# Per-stage CPU profiling in fill_half. When enabled, every major DSP
+# stage (input pop / preamp / loudness / input PEQ / crossfeed +
+# leveller / matrix mixer / output PEQ / delay+gain+convert) writes a
+# DWT cycle delta into audio_stage_cycles[]. Vendor command 0xEC dumps
+# the array. Cost is ~4 cycles per stage × 8 stages × 250 Hz fill_half
+# rate ≈ 0.4% CPU when enabled — turn off for shipping builds. Override
+# with -DDSPI_AUDIO_STAGE_PROFILING=ON on the cmake command line.
+option(DSPI_AUDIO_STAGE_PROFILING "Per-stage cycle counters in fill_half" OFF)
+if(DSPI_AUDIO_STAGE_PROFILING)
+    target_compile_definitions(${EXE} PRIVATE DSPI_AUDIO_STAGE_PROFILING)
+endif()
+
 # Optimization: -O2 by default; tighten to -Og for first bring-up if you want
 # easier single-stepping.
 target_compile_options(${EXE} PRIVATE
