@@ -63,12 +63,14 @@ void spdif_input_stop(void);
 uint32_t spdif_input_poll(void);
 
 /* Stage 2: drain up to want_frames stereo frames from the SPDIFRX
- * input ring into dst[2 × want_frames] (interleaved L/R int16, same
- * format as usb_ring_pop_frames). Returns frames actually written;
+ * input ring into dst[2 × want_frames] (interleaved L/R float in [-1, 1],
+ * same format as usb_ring_pop_frames). The SPDIF path carries the full
+ * 24-bit input depth end-to-end — the resampler's float output is handed
+ * over without integer requantization. Returns frames actually written;
  * shortfall is silence-padded so the caller never has to handle a
  * partial fill. Called from the SAI1 DMA half-cplt context — must
  * be lock-free vs the SPDIFRX DMA callbacks that fill the ring. */
-uint32_t spdif_input_pop_frames(int16_t *dst, uint32_t want_frames);
+uint32_t spdif_input_pop_frames(float *dst, uint32_t want_frames);
 
 /* Populate the 16-byte status packet for vendor cmd 0xE2. */
 void spdif_input_get_status(SpdifRxStatusPacket *out);

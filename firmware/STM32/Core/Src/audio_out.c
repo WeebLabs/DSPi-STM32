@@ -92,9 +92,11 @@ static int32_t * const audio_buf_b = (int32_t *)AUDIO_BUFFER_BASE_B;
 static int32_t * const audio_buf_c = (int32_t *)AUDIO_BUFFER_BASE_C;
 static int32_t * const audio_buf_d = (int32_t *)AUDIO_BUFFER_BASE_D;
 
-/* Scratch for one half's worth of stereo 16-bit samples popped from the
- * ring; converted to 24-bit-right-aligned in place into audio_buf[]. */
-static int16_t pop_scratch[AUDIO_FRAMES_HALF * 2];
+/* Scratch for one half's worth of interleaved stereo input samples popped
+ * from the active source. Both sources deliver float in [-1, 1] (USB 16-bit
+ * scaled by 1/32768; SPDIF the resampler's full-depth float output), so the
+ * DSP graph consumes it directly without an int staging/quantization step. */
+static float pop_scratch[AUDIO_FRAMES_HALF * 2];
 
 SAI_HandleTypeDef hsai_BlockA1;
 SAI_HandleTypeDef hsai_BlockB1;
@@ -155,7 +157,6 @@ extern const uint32_t audio_fill_budget_cycles;
  * the matrix is irrelevant — Console can drive it but nothing audibly
  * happens until those outputs have hardware backing them. */
 
-#define INT16_RECIP   (1.0f / 32768.0f)
 #define FLOAT_TO_24   8388607.0f      /* 2^23 − 1 */
 
 extern MatrixMixer matrix_mixer;
@@ -373,8 +374,8 @@ static void fill_half(int32_t *dst_a, int32_t *dst_b,
      *               with silence. */
     uint32_t i;
     for (i = 0; i < got; ++i) {
-        buf_l[i] = (float)pop_scratch[2*i + 0] * INT16_RECIP * preamp_l;
-        buf_r[i] = (float)pop_scratch[2*i + 1] * INT16_RECIP * preamp_r;
+        buf_l[i] = pop_scratch[2*i + 0] * preamp_l;
+        buf_r[i] = pop_scratch[2*i + 1] * preamp_r;
     }
     for (; i < AUDIO_FRAMES_HALF; ++i) {
         buf_l[i] = 0.0f;

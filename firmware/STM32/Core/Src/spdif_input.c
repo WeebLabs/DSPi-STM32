@@ -114,14 +114,18 @@ static uint32_t                 last_sync_retry_ms = 0;
 #define SPDIF_RING_BASE    0x24012000UL
 #define SPDIF_RING_FRAMES  1024U
 #define SPDIF_RING_MASK    (SPDIF_RING_FRAMES - 1U)
-static int16_t * const spdif_ring = (int16_t *)SPDIF_RING_BASE;
+/* int32 ring carrying the full 24-bit SPDIF samples (sign-extended). At
+ * 1024 frames × 2 ch × 4 B = 8 KB it exactly fills the 0x24012000-0x24014000
+ * hole below the resampler's filter table. We deliberately do NOT truncate to
+ * int16 here — the float DSP/resampler downstream consume the full depth. */
+static int32_t * const spdif_ring = (int32_t *)SPDIF_RING_BASE;
 static volatile uint32_t spdif_ring_widx = 0;       /* DMA-callback writes */
 static volatile uint32_t spdif_ring_ridx = 0;       /* fill_half reads     */
-/* Last sample captured per channel — held over when the source goes
- * mute / parity-error / not-valid, so a brief bad subframe doesn't
- * inject a click. */
-static int16_t  last_sample_l = 0;
-static int16_t  last_sample_r = 0;
+/* Last sample captured per channel (24-bit, sign-extended) — held over when
+ * the source goes mute / parity-error / not-valid, so a brief bad subframe
+ * doesn't inject a click. */
+static int32_t  last_sample_l = 0;
+static int32_t  last_sample_r = 0;
 
 /* Channel-status accumulator — 192 bits = 24 bytes per IEC block.
  * CSR words deliver one CS bit at a time; we shift them in and snapshot
@@ -236,12 +240,10 @@ void SPDIF_RX_IRQHandler(void)     { HAL_SPDIFRX_IRQHandler(&hspdif); }
  * on left and gets sample-replaced if invalid.
  *
  * Per word we:
- *   1. Sign-extend the 24-bit audio to int32 (`(w << 8) >> 8`)
- *   2. Truncate to int16 for the ring (DSPi internal format is int16
- *      stereo to match the USB UAC1 path; the DSP pipeline upscales
- *      back to float before EQ/matrix). Throws away 8 LSBs but matches
- *      the bit depth USB delivers, so SPDIF and USB sources sound
- *      identical through the DSP graph.
+ *   1. Sign-extend the 24-bit audio to int32 (`(w << 8) >> 8`) and store the
+ *      full 24-bit value in the ring — no truncation. The resampler and the
+ *      DSP graph are float, so they consume the full input depth; SPDIF is no
+ *      longer needlessly degraded to the 16-bit depth USB happens to deliver.
  *   3. If V or PE bit set, hold last good sample (mute the bad
  *      subframe rather than emit garbage).
  *   4. When we have both an L and an R, write the stereo frame to
@@ -252,8 +254,8 @@ void SPDIF_RX_IRQHandler(void)     { HAL_SPDIFRX_IRQHandler(&hspdif); }
  * 48 kHz = 5.3 ms callback-to-callback, easily within budget. */
 static void spdif_demux_words(const uint32_t *words, uint16_t count) {
     bool have_l = false, have_r = false;
-    int16_t pending_l = last_sample_l;
-    int16_t pending_r = last_sample_r;
+    int32_t pending_l = last_sample_l;
+    int32_t pending_r = last_sample_r;
     uint32_t widx = spdif_ring_widx;
 
     for (uint16_t i = 0; i < count; ++i) {
@@ -262,9 +264,8 @@ static void spdif_demux_words(const uint32_t *words, uint16_t count) {
         if (err) {
             if (w & (1u << 24)) parity_errors++;          /* count PE only */
         }
-        /* sign-extend 24-bit → int32, then drop low 8 bits → int16 */
-        int32_t s32 = (int32_t)(w << 8) >> 8;
-        int16_t s16 = err ? 0 : (int16_t)(s32 >> 8);
+        /* sign-extend 24-bit → int32 and keep full depth (no truncation) */
+        int32_t s32 = err ? 0 : ((int32_t)(w << 8) >> 8);
 
         /* STM32H7 SPDIFRX PT encoding (empirically verified via raw DR
          * snapshot — vendor cmd 0xF8):
@@ -279,10 +280,10 @@ static void spdif_demux_words(const uint32_t *words, uint16_t count) {
          * else means LEFT. */
         uint8_t pt = (uint8_t)((w >> 28) & 0x3);
         if (pt == 0x3) {            /* W preamble = right channel */
-            pending_r = s16;
+            pending_r = s32;
             have_r = true;
         } else {                    /* B/M = left channel */
-            pending_l = s16;
+            pending_l = s32;
             have_l = true;
         }
         if (have_l && have_r) {
@@ -627,8 +628,12 @@ static float * const pop_in_r  = (float *)POP_BUF_INPUT_R_ADDR;
 static float * const pop_out_l = (float *)POP_BUF_OUTPUT_L_ADDR;
 static float * const pop_out_r = (float *)POP_BUF_OUTPUT_R_ADDR;
 
+/* 24-bit full-scale reciprocal: ring samples are sign-extended 24-bit, so
+ * [-2^23, 2^23-1] maps to ~[-1, 1). */
+#define SPDIF_INT24_RECIP   (1.0f / 8388608.0f)
+
 /* Pop `want_frames` raw input frames from the demux ring into the
- * pop_in_l / pop_in_r float buffers (int16 → float [-1, 1]).
+ * pop_in_l / pop_in_r float buffers (24-bit int → float [-1, 1]).
  * Returns the number actually popped. */
 static uint32_t pop_raw_to_float(uint32_t want_frames) {
     uint32_t widx = spdif_ring_widx;
@@ -642,20 +647,22 @@ static uint32_t pop_raw_to_float(uint32_t want_frames) {
     if (got > POP_INPUT_MAX_FRAMES) got = POP_INPUT_MAX_FRAMES;
     for (uint32_t i = 0; i < got; ++i) {
         uint32_t pos = ((ridx + i) & SPDIF_RING_MASK) * 2;
-        pop_in_l[i] = (float)spdif_ring[pos + 0] * (1.0f / 32768.0f);
-        pop_in_r[i] = (float)spdif_ring[pos + 1] * (1.0f / 32768.0f);
+        pop_in_l[i] = (float)spdif_ring[pos + 0] * SPDIF_INT24_RECIP;
+        pop_in_r[i] = (float)spdif_ring[pos + 1] * SPDIF_INT24_RECIP;
     }
     spdif_ring_ridx = ridx + got;
     return got;
 }
 
-/* Consumer API used by audio_out.c::fill_half when SPDIF is the
- * active input. Reads raw int16 frames from the demux ring, converts
- * to float, passes through the polyphase resampler (which interpolates
- * to the SAI rate based on its current `step` ratio), converts back
- * to int16. The PI servo (in servo_tick) drives `step` so that the
- * ring fill stays at target. */
-uint32_t spdif_input_pop_frames(int16_t *dst, uint32_t want_frames) {
+/* Consumer API used by audio_out.c::fill_half when SPDIF is the active
+ * input. Reads the full-depth 24-bit frames from the demux ring, converts
+ * to float [-1, 1], passes through the polyphase resampler (which
+ * interpolates to the SAI rate based on its current `step` ratio), and
+ * writes the resampler's native float output straight into `dst` — no
+ * intermediate integer requantization, so the only depth loss in the whole
+ * SPDIF path is the resampler itself. The PI servo (servo_tick) drives
+ * `step` so the ring fill stays at target. `dst` is interleaved L/R float. */
+uint32_t spdif_input_pop_frames(float *dst, uint32_t want_frames) {
     if (want_frames == 0) return 0;
     if (want_frames > POP_OUTPUT_MAX_FRAMES) want_frames = POP_OUTPUT_MAX_FRAMES;
 
@@ -672,13 +679,13 @@ uint32_t spdif_input_pop_frames(int16_t *dst, uint32_t want_frames) {
         uint32_t got = (avail < want_frames) ? avail : want_frames;
         for (uint32_t i = 0; i < got; ++i) {
             uint32_t pos = ((ridx + i) & SPDIF_RING_MASK) * 2;
-            dst[i * 2 + 0] = spdif_ring[pos + 0];
-            dst[i * 2 + 1] = spdif_ring[pos + 1];
+            dst[i * 2 + 0] = (float)spdif_ring[pos + 0] * SPDIF_INT24_RECIP;
+            dst[i * 2 + 1] = (float)spdif_ring[pos + 1] * SPDIF_INT24_RECIP;
         }
         spdif_ring_ridx = ridx + got;
         for (uint32_t i = got; i < want_frames; ++i) {
-            dst[i * 2 + 0] = 0;
-            dst[i * 2 + 1] = 0;
+            dst[i * 2 + 0] = 0.0f;
+            dst[i * 2 + 1] = 0.0f;
         }
         return got;
     }
@@ -700,21 +707,15 @@ uint32_t spdif_input_pop_frames(int16_t *dst, uint32_t want_frames) {
         spdif_ring_ridx -= (uint32_t)((int32_t)got - processed);
     }
 
-    /* Convert float → int16 with clipping. */
+    /* Hand the resampler's float output straight to the DSP graph. */
     for (int32_t i = 0; i < out_count; ++i) {
-        float l = pop_out_l[i] * 32768.0f;
-        float r = pop_out_r[i] * 32768.0f;
-        if (l >  32767.0f) l =  32767.0f;
-        if (l < -32768.0f) l = -32768.0f;
-        if (r >  32767.0f) r =  32767.0f;
-        if (r < -32768.0f) r = -32768.0f;
-        dst[i * 2 + 0] = (int16_t)l;
-        dst[i * 2 + 1] = (int16_t)r;
+        dst[i * 2 + 0] = pop_out_l[i];
+        dst[i * 2 + 1] = pop_out_r[i];
     }
     /* Silence-pad shortfall. */
     for (int32_t i = out_count; i < (int32_t)want_frames; ++i) {
-        dst[i * 2 + 0] = 0;
-        dst[i * 2 + 1] = 0;
+        dst[i * 2 + 0] = 0.0f;
+        dst[i * 2 + 1] = 0.0f;
     }
     return (uint32_t)out_count;
 }
@@ -953,8 +954,8 @@ void spdif_input_init(void)               { }
 void spdif_input_start(void)              { }
 void spdif_input_stop(void)               { }
 uint32_t spdif_input_poll(void)           { return 0; }
-uint32_t spdif_input_pop_frames(int16_t *dst, uint32_t want_frames) {
-    if (dst) for (uint32_t i = 0; i < want_frames * 2; ++i) dst[i] = 0;
+uint32_t spdif_input_pop_frames(float *dst, uint32_t want_frames) {
+    if (dst) for (uint32_t i = 0; i < want_frames * 2; ++i) dst[i] = 0.0f;
     return 0;
 }
 void spdif_input_get_status(SpdifRxStatusPacket *out) {

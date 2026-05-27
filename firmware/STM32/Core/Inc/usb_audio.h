@@ -97,7 +97,7 @@ void get_default_channel_name(int ch, uint8_t input_source,
  * silence. The ring is power-of-two sized so the modulo is a mask. */
 #define USB_RING_FRAMES   1024U     /* 21 ms at 48 kHz, ~4 KB */
 
-uint32_t usb_ring_pop_frames(int16_t *dst, uint32_t want_frames);
+uint32_t usb_ring_pop_frames(float *dst, uint32_t want_frames);
 uint32_t usb_ring_level_frames(void);   /* current fill, for diagnostics */
 
 #endif

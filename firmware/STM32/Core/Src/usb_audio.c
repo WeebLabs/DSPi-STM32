@@ -70,14 +70,16 @@ static inline uint32_t usb_ring_free(void) {
 
 uint32_t usb_ring_level_frames(void) { return usb_ring_used(); }
 
-uint32_t usb_ring_pop_frames(int16_t *dst, uint32_t want_frames) {
+uint32_t usb_ring_pop_frames(float *dst, uint32_t want_frames) {
     uint32_t avail = usb_ring_used();
     uint32_t n     = (want_frames < avail) ? want_frames : avail;
     uint32_t tail  = usb_ring_tail;
+    /* UAC1 delivers 16-bit; convert to float [-1, 1] to match the SPDIF path
+     * and feed the float DSP graph directly (no shared int staging buffer). */
     for (uint32_t i = 0; i < n; ++i) {
         uint32_t pkt = usb_ring[tail];
-        dst[2*i + 0] = (int16_t)(pkt & 0xFFFF);          /* L */
-        dst[2*i + 1] = (int16_t)((pkt >> 16) & 0xFFFF);  /* R */
+        dst[2*i + 0] = (float)(int16_t)(pkt & 0xFFFF)         * (1.0f / 32768.0f);
+        dst[2*i + 1] = (float)(int16_t)((pkt >> 16) & 0xFFFF) * (1.0f / 32768.0f);
         tail = (tail + 1) & USB_RING_FRAMES_MASK;
     }
     usb_ring_tail = tail;
