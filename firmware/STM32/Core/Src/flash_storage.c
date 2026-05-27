@@ -643,24 +643,31 @@ static void apply_master_volume_db(float db) {
     update_master_volume(db);
 }
 
-// Decide whether/which dB value to apply to master volume based on mode.
-//   mode 1 (per-preset): always apply — slot->master_volume_db if available
-//     (V12+), else the directory value (older slots / no slot).
-//   mode 0 (independent): master volume is decoupled from presets.  Only a
-//     BOOT restore re-applies the saved directory value; runtime preset
-//     loads/deletes/factory-resets leave the live value untouched, honoring
-//     the contract "loading a preset never changes it".  This intentionally
-//     differs from the RP reference firmware, which re-applies on every load —
-//     see Documentation/Features/master_volume_independent_load.md in the RP
-//     repo for the cross-platform note.
-// `slot_or_null` may be NULL (factory-defaults / empty-slot path).
+// Re-derive the live master volume for a given preset *context*.  This is the
+// single source of truth for what master volume becomes whenever the active
+// preset context changes (preset load, active-slot delete, boot).  Callers that
+// only reset the DSP processing chain without switching context (factory reset)
+// must NOT call it — they leave the master-volume ceiling intact.
+//
+//   mode 1 (per-preset): master volume travels with the preset.  A configured
+//     V12+ slot carries its own value; any context without a per-preset value
+//     (an empty slot, or a legacy pre-V12 preset) is "factory defaults" and so
+//     gets the power-on default — exactly as EQ resets to flat, delays to zero.
+//   mode 0 (independent): master volume is decoupled from presets.  Only a BOOT
+//     restore re-applies the saved device-level value; runtime context changes
+//     leave the live value untouched, honoring the console contract "loading a
+//     preset never changes it".  This intentionally differs from the RP
+//     reference firmware (which re-applies on every load) — see
+//     Documentation/Features/master_volume_independent_load.md in the RP repo.
+//
+// `slot_or_null` is the loaded slot, or NULL for an empty/factory-default
+// context.  `is_boot` is true only on the power-on restore path.
 static void apply_master_volume_from_mode(const PresetSlot *slot_or_null,
                                           bool is_boot) {
     if (dir_cache.master_volume_mode == MASTER_VOLUME_MODE_WITH_PRESET) {
-        float db = (slot_or_null && slot_or_null->version >= 12)
-                 ? slot_or_null->master_volume_db
-                 : dir_cache.master_volume_db;
-        apply_master_volume_db(db);
+        bool slot_has_value = slot_or_null && slot_or_null->version >= 12;
+        apply_master_volume_db(slot_has_value ? slot_or_null->master_volume_db
+                                              : MASTER_VOL_DEFAULT_DB);
     } else if (is_boot) {
         apply_master_volume_db(dir_cache.master_volume_db);
     }
@@ -941,6 +948,7 @@ uint8_t preset_load(uint8_t slot) {
     notify_push_preset_loaded(slot);
     notify_begin_bulk(PARAM_SRC_PRESET);
 
+    const PresetSlot *loaded_slot = NULL;
     if (dir_cache.slot_occupied & (1u << slot)) {
         // Slot has user data — validate and load it
         const PresetSlot *s = validate_slot(slot);
@@ -950,14 +958,14 @@ uint8_t preset_load(uint8_t slot) {
             return PRESET_ERR_CRC;
         }
         apply_slot_to_live(s, dir_cache.include_pins != 0);
-        // Runtime load (is_boot=false): in independent mode this is a no-op so
-        // the live master volume survives the load; in with-preset mode it
-        // restores the slot's saved value.
-        apply_master_volume_from_mode(s, false);
+        loaded_slot = s;
     } else {
         // Slot not configured — apply factory defaults
         apply_factory_defaults();
     }
+    // Runtime context switch: re-derive master volume for the loaded context
+    // (loaded_slot, or NULL for the empty/factory-default case).
+    apply_master_volume_from_mode(loaded_slot, false);
 
     // Recalculate filters and delays for the current sample rate
     extern volatile AudioState audio_state;
@@ -1039,6 +1047,10 @@ uint8_t preset_delete(uint8_t slot) {
         __dmb();
 
         apply_factory_defaults();
+        // The active preset context is now empty — re-derive master volume the
+        // same way loading an empty preset does (with-preset => factory default,
+        // independent => untouched).
+        apply_master_volume_from_mode(NULL, false);
 
         extern volatile AudioState audio_state;
         float rate = (float)audio_state.freq;
@@ -1319,11 +1331,12 @@ static void apply_factory_defaults(void) {
         global_preamp_linear[i]  = 1.0f;
     }
 
-    // Master volume is intentionally NOT touched here.  apply_factory_defaults
-    // runs on runtime paths (empty-slot load, active-slot delete, factory-reset
-    // command) where the independent-mode contract requires the live master
-    // volume to survive, and on boot paths where preset_boot_load() restores it
-    // explicitly via apply_master_volume_from_mode(..., /*is_boot=*/true).
+    // Master volume is intentionally NOT touched here.  This resets only the
+    // DSP processing chain; the master-volume ceiling is owned exclusively by
+    // apply_master_volume_from_mode(), which the preset-*context* callers
+    // (preset_load / preset_delete / preset_boot_load) invoke after this
+    // returns.  flash_factory_reset() deliberately does not, so a factory reset
+    // leaves the ceiling intact.
 
     // Bypass
     bypass_master_eq = false;
@@ -1414,6 +1427,11 @@ static void apply_factory_defaults(void) {
 void flash_factory_reset(void) {
     // Bracket so per-field writes in apply_factory_defaults() are suppressed
     // and the host sees exactly one BULK_INVALIDATED(source=FACTORY).
+    //
+    // Master volume is deliberately left untouched: a factory reset clears the
+    // DSP processing chain but is NOT a preset-context switch, so it does not
+    // re-derive the master-volume ceiling (in either mode).  Only load / delete
+    // / boot do that, via apply_master_volume_from_mode().
     notify_begin_bulk(PARAM_SRC_FACTORY);
     apply_factory_defaults();
     notify_end_bulk();
