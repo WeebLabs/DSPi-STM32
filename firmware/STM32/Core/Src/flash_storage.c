@@ -900,6 +900,24 @@ static const PresetSlot *validate_slot(uint8_t slot) {
     return s;
 }
 
+// After any wholesale live-state change (preset load, factory reset), recompute
+// every filter + delay-sample count for the current sample rate and clear the
+// delay lines so stale audio from the previous state can't bleed through.
+static void reinit_dsp_for_current_rate(void) {
+    extern volatile AudioState audio_state;
+    float rate = (float)audio_state.freq;
+    dsp_recalculate_all_filters(rate);
+    dsp_update_delay_samples(rate);
+
+    extern
+#if PICO_RP2350 || defined(STM32H723xx)
+    float delay_lines[NUM_DELAY_CHANNELS][MAX_DELAY_SAMPLES];
+#else
+    int32_t delay_lines[NUM_DELAY_CHANNELS][MAX_DELAY_SAMPLES];
+#endif
+    memset(delay_lines, 0, sizeof(delay_lines));
+}
+
 // ============================================================================
 // PUBLIC PRESET API
 // ============================================================================
@@ -967,23 +985,8 @@ uint8_t preset_load(uint8_t slot) {
     // (loaded_slot, or NULL for the empty/factory-default case).
     apply_master_volume_from_mode(loaded_slot, false);
 
-    // Recalculate filters and delays for the current sample rate
-    extern volatile AudioState audio_state;
-    float rate = (float)audio_state.freq;
-    dsp_recalculate_all_filters(rate);
-    dsp_update_delay_samples(rate);
-
-    // Zero all delay line buffers.  Without this, stale audio from the
-    // previous preset's delay lines bleeds through — e.g. switching from
-    // a 40ms delay to 0ms would replay ~40ms of old audio as the write
-    // index wraps past the old data.
-    extern
-#if PICO_RP2350 || defined(STM32H723xx)
-    float delay_lines[NUM_DELAY_CHANNELS][MAX_DELAY_SAMPLES];
-#else
-    int32_t delay_lines[NUM_DELAY_CHANNELS][MAX_DELAY_SAMPLES];
-#endif
-    memset(delay_lines, 0, sizeof(delay_lines));
+    // Recompute filters/delays for the current rate and clear the delay lines.
+    reinit_dsp_for_current_rate();
 
 #if !defined(STM32H723xx)
     // Transition Core 1 mode to match the new output enable state
@@ -1425,6 +1428,12 @@ static void apply_factory_defaults(void) {
 }
 
 void flash_factory_reset(void) {
+    // Engage mute before the wholesale live-state rewrite to avoid an audible
+    // glitch (same convention as preset_save / preset_delete).
+    preset_mute_counter = flash_mute_hold_samples();
+    preset_loading = true;
+    __dmb();
+
     // Bracket so per-field writes in apply_factory_defaults() are suppressed
     // and the host sees exactly one BULK_INVALIDATED(source=FACTORY).
     //
@@ -1434,5 +1443,9 @@ void flash_factory_reset(void) {
     // / boot do that, via apply_master_volume_from_mode().
     notify_begin_bulk(PARAM_SRC_FACTORY);
     apply_factory_defaults();
+    reinit_dsp_for_current_rate();
     notify_end_bulk();
+
+    // Does NOT modify the directory or active-slot tracking (the active preset
+    // stays selected); only live DSP state is reset.
 }

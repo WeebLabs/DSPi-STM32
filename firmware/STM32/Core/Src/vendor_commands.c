@@ -978,6 +978,23 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                             (tusb_control_request_t *)req,
                                             &status, 1);
                 }
+                case REQ_FACTORY_RESET: {
+                    /* Action command (IN, 1-byte status): reset all live DSP
+                     * state to factory defaults.  flash_factory_reset() handles
+                     * mute, the bulk-notify bracket, filter/delay recompute and
+                     * delay-line clear; it leaves the directory/active slot and
+                     * (per policy) master volume untouched. */
+                    flash_factory_reset();
+                    static uint8_t status = FLASH_OK;
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &status, 1);
+                }
+                /* REQ_ENTER_BOOTLOADER (0xF0) is intentionally unsupported on
+                 * STM32: software entry to the H7 ROM DFU bootloader proved
+                 * unreliable (the jump reaches the ROM with valid vectors but
+                 * USB DFU never enumerates). Falls through to the default
+                 * "unhandled" response — use BOOT0 + NRST to enter DFU. */
 
                 /* ---- Clear clips ---- */
                 case REQ_CLEAR_CLIPS: {
