@@ -848,9 +848,29 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
 
                 /* ---- Master volume mode (independent / per-preset) ---- */
                 case REQ_GET_MASTER_VOLUME_MODE: {
-                    static uint8_t v = 0; /* MASTER_VOLUME_MODE_INDEPENDENT */
+                    static uint8_t v;
+                    uint16_t occ; uint8_t m, d, la, inc_pins;
+                    preset_get_directory(&occ, &m, &d, &la, &inc_pins, &v);
                     return tud_control_xfer(rhport,
                                             (tusb_control_request_t *)req, &v, 1);
+                }
+                case REQ_GET_SAVED_MASTER_VOLUME: {
+                    /* Directory's independent master volume (mode-0 boot value). */
+                    static float v;
+                    v = preset_get_saved_master_volume();
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req, &v, 4);
+                }
+                case REQ_SAVE_MASTER_VOLUME: {
+                    /* Action command (mirrors REQ_PRESET_SAVE): persist the live
+                     * master volume into the directory's independent field and
+                     * ship the 1-byte status in this transfer's data stage.
+                     * Inline flash write — same convention as REQ_PRESET_SAVE. */
+                    static uint8_t status;
+                    status = preset_save_master_volume();
+                    return tud_control_xfer(rhport,
+                                            (tusb_control_request_t *)req,
+                                            &status, 1);
                 }
 
                 /* ---- SPDIF RX pin (fixed PD8 / WeAct P1 pin 40 on STM32) ---- */
@@ -1566,6 +1586,14 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
             case REQ_PRESET_SET_INCLUDE_PINS: {
                 if (vendor_last_wLength >= 1) {
                     preset_set_include_pins(vendor_rx_buf[0] != 0);
+                }
+                break;
+            }
+            case REQ_SET_MASTER_VOLUME_MODE: {
+                /* Payload: 1 byte mode (0 = independent, 1 = with-preset).
+                 * preset_set_master_volume_mode() clamps + flushes the dir. */
+                if (vendor_last_wLength >= 1) {
+                    preset_set_master_volume_mode(vendor_rx_buf[0]);
                 }
                 break;
             }
