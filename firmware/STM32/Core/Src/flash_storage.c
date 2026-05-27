@@ -643,22 +643,28 @@ static void apply_master_volume_db(float db) {
     update_master_volume(db);
 }
 
-// Decide which dB value to apply to master volume based on current mode.
-//   mode 0 (independent): use dir_cache.master_volume_db, which was set
-//     either by a prior REQ_SAVE_MASTER_VOLUME or by fresh-directory init.
-//   mode 1 (per-preset):  use slot->master_volume_db if available (V12+).
-//     Falls back to the directory value for older slots so we never leave
-//     the live globals at a stale value from a previous load.
-// `slot_or_null` may be NULL (e.g. factory-defaults path with no slot).
-static void apply_master_volume_from_mode(const PresetSlot *slot_or_null) {
-    float db;
-    if (dir_cache.master_volume_mode == MASTER_VOLUME_MODE_WITH_PRESET
-        && slot_or_null && slot_or_null->version >= 12) {
-        db = slot_or_null->master_volume_db;
-    } else {
-        db = dir_cache.master_volume_db;
+// Decide whether/which dB value to apply to master volume based on mode.
+//   mode 1 (per-preset): always apply — slot->master_volume_db if available
+//     (V12+), else the directory value (older slots / no slot).
+//   mode 0 (independent): master volume is decoupled from presets.  Only a
+//     BOOT restore re-applies the saved directory value; runtime preset
+//     loads/deletes/factory-resets leave the live value untouched, honoring
+//     the contract "loading a preset never changes it".  This intentionally
+//     differs from the RP reference firmware, which re-applies on every load —
+//     see Documentation/Features/master_volume_independent_load.md in the RP
+//     repo for the cross-platform note.
+// `slot_or_null` may be NULL (factory-defaults / empty-slot path).
+static void apply_master_volume_from_mode(const PresetSlot *slot_or_null,
+                                          bool is_boot) {
+    if (dir_cache.master_volume_mode == MASTER_VOLUME_MODE_WITH_PRESET) {
+        float db = (slot_or_null && slot_or_null->version >= 12)
+                 ? slot_or_null->master_volume_db
+                 : dir_cache.master_volume_db;
+        apply_master_volume_db(db);
+    } else if (is_boot) {
+        apply_master_volume_db(dir_cache.master_volume_db);
     }
-    apply_master_volume_db(db);
+    // Independent mode + runtime: intentionally a no-op (live value survives).
 }
 
 // Apply a validated PresetSlot to the live DSP state.
@@ -944,7 +950,10 @@ uint8_t preset_load(uint8_t slot) {
             return PRESET_ERR_CRC;
         }
         apply_slot_to_live(s, dir_cache.include_pins != 0);
-        apply_master_volume_from_mode(s);
+        // Runtime load (is_boot=false): in independent mode this is a no-op so
+        // the live master volume survives the load; in with-preset mode it
+        // restores the slot's saved value.
+        apply_master_volume_from_mode(s, false);
     } else {
         // Slot not configured — apply factory defaults
         apply_factory_defaults();
@@ -1218,11 +1227,12 @@ int preset_boot_load(void) {
         }
 
         // Load the slot: user data if occupied, factory defaults if empty
+        const PresetSlot *boot_slot = NULL;
         if ((dir_cache.slot_occupied & (1u << target_slot))) {
             const PresetSlot *s = validate_slot(target_slot);
             if (s) {
                 apply_slot_to_live(s, dir_cache.include_pins != 0);
-                apply_master_volume_from_mode(s);
+                boot_slot = s;
             } else {
                 // Corrupt data — fall back to factory defaults
                 apply_factory_defaults();
@@ -1230,6 +1240,9 @@ int preset_boot_load(void) {
         } else {
             apply_factory_defaults();
         }
+        // Boot restore: always re-apply master volume per mode (independent =>
+        // saved directory value, with-preset => slot value, NULL => directory).
+        apply_master_volume_from_mode(boot_slot, true);
 
         dir_cache.last_active_slot = target_slot;
         return FLASH_OK;
@@ -1241,10 +1254,10 @@ int preset_boot_load(void) {
         const PresetSlot *s = validate_slot(0);
         if (s) {
             apply_slot_to_live(s, false);  // Legacy migration: don't override pins
-            apply_master_volume_from_mode(s);
         } else {
             apply_factory_defaults();
         }
+        apply_master_volume_from_mode(s, true);  // boot restore (s==NULL on fail)
         return FLASH_OK;
     }
 
@@ -1252,6 +1265,7 @@ int preset_boot_load(void) {
     dir_ensure();
     dir_flush();
     apply_factory_defaults();
+    apply_master_volume_from_mode(NULL, true);  // boot restore (default value)
     return FLASH_OK;
 }
 
@@ -1305,12 +1319,11 @@ static void apply_factory_defaults(void) {
         global_preamp_linear[i]  = 1.0f;
     }
 
-    // Master volume — defer to the mode-aware helper so mode 0 restores the
-    // directory's independent value instead of always stomping to unity.
-    // (Mode 1 with slot_or_null=NULL also falls back to the directory value.)
-    // Notifications are emitted via update_master_volume() inside
-    // apply_master_volume_db().
-    apply_master_volume_from_mode(NULL);
+    // Master volume is intentionally NOT touched here.  apply_factory_defaults
+    // runs on runtime paths (empty-slot load, active-slot delete, factory-reset
+    // command) where the independent-mode contract requires the live master
+    // volume to survive, and on boot paths where preset_boot_load() restores it
+    // explicitly via apply_master_volume_from_mode(..., /*is_boot=*/true).
 
     // Bypass
     bypass_master_eq = false;
