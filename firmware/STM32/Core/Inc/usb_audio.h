@@ -18,7 +18,8 @@
 #define AUDIO_FB_ENDPOINT       0x82    /* ISO IN feedback, async sync */
 
 /* ---- Sample format ---- */
-#define AUDIO_SAMPLE_RATE       48000U
+#define AUDIO_SAMPLE_RATE       48000U   /* default/native rate, advertised first */
+#define AUDIO_SAMPLE_RATE_ALT   44100U   /* second host-selectable rate */
 #define AUDIO_CHANNELS          2
 #define AUDIO_BIT_DEPTH         16U
 #define AUDIO_BYTES_PER_SAMPLE  (AUDIO_BIT_DEPTH / 8)
@@ -98,6 +99,15 @@ void get_default_channel_name(int ch, uint8_t input_source,
 #define USB_RING_FRAMES   1024U     /* 21 ms at 48 kHz, ~4 KB */
 
 uint32_t usb_ring_pop_frames(float *dst, uint32_t want_frames);
+
+/* Rebake the ISO feedback nominal for a new sample rate (44100 / 48000). */
+void usb_audio_set_feedback_rate(uint32_t fs);
+
+/* Host SET_CUR(SAM_FREQ) flags a deferred rate change; the main loop drains it
+ * via Audio_SetSampleRate (the PLL2/SAI retune is too heavy for the control
+ * callback). */
+extern volatile bool     usb_rate_change_pending;
+extern volatile uint32_t usb_rate_change_target;
 uint32_t usb_ring_level_frames(void);   /* current fill, for diagnostics */
 
 #endif

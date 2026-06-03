@@ -196,6 +196,13 @@ int main(void) {
     for (;;) {
         USB_Task();
 
+        /* USB host selected a sample rate (SET_CUR SAM_FREQ). Do the heavy
+         * PLL2/SAI retune here, off the control-transfer callback. */
+        if (usb_rate_change_pending) {
+            usb_rate_change_pending = false;
+            Audio_SetSampleRate(usb_rate_change_target);
+        }
+
         /* Drain bulk-params SETs deferred from the USB IRQ. Console funnels
          * a lot of parameter changes (delays, master vol, leveller, etc.)
          * through REQ_SET_ALL_PARAMS rather than the per-param SETs, so

@@ -73,8 +73,10 @@ uint8_t const *tud_descriptor_device_cb(void) {
 #define U16_LE(x)   ((x) & 0xFF), (((x) >> 8) & 0xFF)
 #define U24_LE(x)   ((x) & 0xFF), (((x) >> 8) & 0xFF), (((x) >> 16) & 0xFF)
 
-/* M7a: vendor interface (itf 2, 9 B) + std bulk IN notify EP (7 B) appended. */
-#define CONFIG_TOTAL_LEN 143
+/* M7a: vendor interface (itf 2, 9 B) + std bulk IN notify EP (7 B) appended.
+ * +3 B vs the original 143 for the second discrete sample rate (44.1 kHz) in
+ * the Type-I format descriptor. */
+#define CONFIG_TOTAL_LEN 146
 
 static uint8_t const desc_configuration[CONFIG_TOTAL_LEN] = {
     /* ---- 0: Configuration ---- */
@@ -165,17 +167,18 @@ static uint8_t const desc_configuration[CONFIG_TOTAL_LEN] = {
     1,                        /* bDelay (frames) */
     U16_LE(AUDIO_DATA_FORMAT_TYPE_I_PCM),
 
-    /* ---- 91: AS CS format type I (PCM, 2 ch, 2 byte/sample, 16-bit, 1 freq) ---- */
-    11, TUSB_DESC_CS_INTERFACE,
+    /* ---- 91: AS CS format type I (PCM, 2 ch, 2 byte/sample, 16-bit, 2 freqs) ---- */
+    14, TUSB_DESC_CS_INTERFACE,
     AUDIO_CS_AS_INTERFACE_FORMAT_TYPE,
     AUDIO_FORMAT_TYPE_I,
     AUDIO_CHANNELS,
     AUDIO_BYTES_PER_SAMPLE,   /* bSubframeSize */
     AUDIO_BIT_DEPTH,          /* bBitResolution */
-    1,                        /* bSamFreqType (one discrete sample rate) */
-    U24_LE(AUDIO_SAMPLE_RATE),
+    2,                        /* bSamFreqType (two discrete sample rates) */
+    U24_LE(AUDIO_SAMPLE_RATE),       /* 48000 (default) */
+    U24_LE(AUDIO_SAMPLE_RATE_ALT),   /* 44100 */
 
-    /* ---- 102: Std iso EP OUT (async, max 200 B, 1 ms interval) ---- */
+    /* ---- 105: Std iso EP OUT (async, max 200 B, 1 ms interval) ---- */
     9, TUSB_DESC_ENDPOINT,
     AUDIO_OUT_ENDPOINT,
     0x05,                     /* bmAttributes: ISO (0x01) + async (0x04) + data (0x00) */
@@ -184,7 +187,7 @@ static uint8_t const desc_configuration[CONFIG_TOTAL_LEN] = {
     0,                        /* bRefresh — required field, ignored for data EP */
     AUDIO_FB_ENDPOINT,        /* bSynchAddress — points to feedback EP */
 
-    /* ---- 111: CS iso data EP — declares sampling-frequency control ----
+    /* ---- 114: CS iso data EP — declares sampling-frequency control ----
      * macOS treats this byte as the discovery hint for the device's
      * sample-rate query path. With bmAttributes=0 ("no controls"),
      * Core Audio binds the format briefly on SET_INTERFACE alt 1 then
@@ -196,7 +199,7 @@ static uint8_t const desc_configuration[CONFIG_TOTAL_LEN] = {
     0,                        /* bLockDelayUnits */
     U16_LE(0),                /* wLockDelay */
 
-    /* ---- 118: Std iso feedback EP IN (3 bytes, 1 ms) ----
+    /* ---- 121: Std iso feedback EP IN (3 bytes, 1 ms) ----
      * UAC1 spec mandates 10.14 fixed-point in exactly 3 bytes for FS.
      * macOS enumerates either way but rejects the stream on alt 1
      * unless wMaxPacketSize == 3. The dwc2 ISO FIFO is still
@@ -211,7 +214,7 @@ static uint8_t const desc_configuration[CONFIG_TOTAL_LEN] = {
     2,                        /* bRefresh — host polls every 2^2 ms */
     0,                        /* bSynchAddress */
 
-    /* ---- 127: Vendor std interface (itf 2, 1 EP, class 0xFF) ---- */
+    /* ---- 130: Vendor std interface (itf 2, 1 EP, class 0xFF) ---- */
     9, TUSB_DESC_INTERFACE,
     ITF_NUM_VENDOR, 0, 1,     /* itf number, alt, num EPs (notify) */
     0xFF,                     /* bInterfaceClass: vendor specific */
@@ -219,7 +222,7 @@ static uint8_t const desc_configuration[CONFIG_TOTAL_LEN] = {
     0x00,                     /* bInterfaceProtocol */
     0x00,                     /* iInterface */
 
-    /* ---- 136: Std bulk IN notification EP (0x83, 64 B FS bulk) ---- */
+    /* ---- 139: Std bulk IN notification EP (0x83, 64 B FS bulk) ---- */
     7, TUSB_DESC_ENDPOINT,
     NOTIFY_IN_ENDPOINT,
     TUSB_XFER_BULK,           /* bmAttributes (0x02 — bulk) */

@@ -30,13 +30,25 @@
 static uint8_t __attribute__((aligned(4))) audio_out_buf[AUDIO_EP_MAX_PKT];
 
 /* Feedback EP packet — 10.14 fixed-point in 3 bytes, but the DCD/dwc2
- * iso allocator reserves 4 bytes minimum. Pre-baked nominal value for
- * 48 kHz at FS: 48 << 14 = 0x000C0000 → little-endian {0x00, 0x00, 0x0C}.
- * In M4-onwards, this gets replaced by a SOF-driven PID controller that
- * trims based on the device's actual audio clock. */
+ * iso allocator reserves 4 bytes minimum. Nominal value = (Fs/1000) << 14
+ * samples per FS frame: 48 kHz → 48<<14 = 0x000C0000 → LE {0x00,0x00,0x0C};
+ * 44.1 kHz → round(44.1×16384) = 722534 = 0x000B0526 → LE {0x26,0x05,0x0B}.
+ * usb_audio_set_feedback_rate() rebakes this when the host switches rate. */
 static uint8_t __attribute__((aligned(4))) audio_fb_buf[4] = {
     0x00, 0x00, 0x0C, 0x00,
 };
+
+/* Deferred host-rate-select → main loop (see usb_audio.h). */
+volatile bool     usb_rate_change_pending = false;
+volatile uint32_t usb_rate_change_target  = AUDIO_SAMPLE_RATE;
+
+void usb_audio_set_feedback_rate(uint32_t fs) {
+    /* (Fs << 14) / 1000, rounded — the device's nominal samples-per-frame. */
+    uint32_t fb = (uint32_t)(((uint64_t)fs * 16384u + 500u) / 1000u);
+    audio_fb_buf[0] = (uint8_t)(fb       & 0xFF);
+    audio_fb_buf[1] = (uint8_t)((fb >> 8)  & 0xFF);
+    audio_fb_buf[2] = (uint8_t)((fb >> 16) & 0xFF);
+}
 
 /* ---------------- Public counters (heartbeat reads these) ---------------- */
 volatile uint32_t audio_bytes_received   = 0;
@@ -291,13 +303,14 @@ static bool handle_get_request(uint8_t stage, tusb_control_request_t const *req)
             }
         }
     } else if (recip == UAC1_RECIPIENT_ENDPOINT) {
-        /* Sample-frequency control on the EP. Only one rate (48 kHz). */
+        /* Sample-frequency control on the EP. We advertise 44100 + 48000;
+         * GET_CUR returns whichever is currently live (audio_state.freq). */
         if (cs == AUDIO_CS_CTRL_SAM_FREQ && req->bRequest == UAC1_REQ_GET_CUR) {
-            static uint8_t freq[3] = {
-                (AUDIO_SAMPLE_RATE)       & 0xFF,
-                (AUDIO_SAMPLE_RATE >>  8) & 0xFF,
-                (AUDIO_SAMPLE_RATE >> 16) & 0xFF,
-            };
+            static uint8_t freq[3];
+            uint32_t f = audio_state.freq;
+            freq[0] = (uint8_t)(f        & 0xFF);
+            freq[1] = (uint8_t)((f >> 8)  & 0xFF);
+            freq[2] = (uint8_t)((f >> 16) & 0xFF);
             return tud_control_xfer(0, (tusb_control_request_t *)req, freq, 3);
         }
     }
@@ -372,6 +385,21 @@ static bool handle_set_request(uint8_t stage, tusb_control_request_t const *req)
             } else if (uac1.pending_cs == AUDIO_FU_CTRL_MUTE &&
                        uac1.pending_len >= 1) {
                 audio_set_mute(uac1_ctrl_buf[0] != 0);
+            }
+        } else if (uac1.pending_cs == AUDIO_CS_CTRL_SAM_FREQ &&
+                   uac1.pending_len >= 3) {
+            /* Host SET_CUR(SAM_FREQ) on the data EP — 3-byte little-endian rate.
+             * Accept only the two advertised rates; defer the heavy PLL2/SAI
+             * retune to the main loop (Audio_SetSampleRate). */
+            uint32_t fs = (uint32_t)uac1_ctrl_buf[0]
+                        | ((uint32_t)uac1_ctrl_buf[1] << 8)
+                        | ((uint32_t)uac1_ctrl_buf[2] << 16);
+            if ((fs == AUDIO_SAMPLE_RATE || fs == AUDIO_SAMPLE_RATE_ALT) &&
+                fs != audio_state.freq) {
+                /* Single-core: volatile write order suffices (target before
+                 * pending); the main loop reads target only when pending. */
+                usb_rate_change_target  = fs;
+                usb_rate_change_pending = true;
             }
         }
     }

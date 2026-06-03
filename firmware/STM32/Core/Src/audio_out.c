@@ -772,6 +772,43 @@ static uint8_t sanitize_output_types(void) {
 }
 
 /* ---------------------------------------------------------------------- */
+/* PLL2_P is the SAI kernel clock; SAI Fs = PLL2_P / 1024. The 48k family
+ * (48/96/192) shares 49.152 MHz, but 44.1 kHz needs a different PLL2 VCO, so a
+ * 48↔44.1 switch retunes PLL2 (N+FRACN only; same M/P/RGE/VCO range). All four
+ * SAI blocks share PLL2_P, so they stay sample-locked across the retune. Must
+ * run with the SAIs torn down (PLL2 can't be reconfigured while clocking a live
+ * peripheral). `current_pll2_fs` tracks the configured family so output-type
+ * HotSwaps at an unchanged rate skip the (glitchy) PLL2 reconfig. */
+static uint32_t current_pll2_fs = 48000;
+static void audio_pll2_configure(uint32_t fs) {
+    if (fs == current_pll2_fs) return;
+    RCC_PeriphCLKInitTypeDef periph = { 0 };
+    periph.PeriphClockSelection = RCC_PERIPHCLK_SAI1
+                                | RCC_PERIPHCLK_SAI4A
+                                | RCC_PERIPHCLK_SAI4B;
+    periph.Sai1ClockSelection  = RCC_SAI1CLKSOURCE_PLL2;
+    periph.Sai4AClockSelection = RCC_SAI4ACLKSOURCE_PLL2;
+    periph.Sai4BClockSelection = RCC_SAI4BCLKSOURCE_PLL2;
+    periph.PLL2.PLL2M = 5;
+    periph.PLL2.PLL2P = 10;
+    periph.PLL2.PLL2Q = 2;
+    periph.PLL2.PLL2R = 5;
+    periph.PLL2.PLL2RGE    = RCC_PLL2VCIRANGE_2;
+    periph.PLL2.PLL2VCOSEL = RCC_PLL2VCOWIDE;
+    if (fs == 44100) {
+        /* VCO = 5 × (90 + 2595/8192) = 451.5839 MHz; /10 → 45.15839 MHz;
+         * /1024 → 44100.0 Hz (−0.3 ppm). */
+        periph.PLL2.PLL2N = 90;
+        periph.PLL2.PLL2FRACN = 2595;
+    } else {
+        /* 48k family: VCO 491.52 MHz; /10 → 49.152 MHz; /1024 → 48000 Hz. */
+        periph.PLL2.PLL2N = 98;
+        periph.PLL2.PLL2FRACN = 2490;
+    }
+    if (HAL_RCCEx_PeriphCLKConfig(&periph) != HAL_OK) Error_Handler();
+    current_pll2_fs = fs;
+}
+
 /* SAI sub-block (re)configuration — type-driven                          */
 /* ---------------------------------------------------------------------- */
 /* Extracted from the original Audio_Init body so Phase 4 can call it
@@ -781,6 +818,9 @@ static uint8_t sanitize_output_types(void) {
  * for ensuring all four sub-blocks are in HAL_SAI_STATE_RESET (i.e.,
  * teardown before re-configure). */
 static void audio_configure_sais(void) {
+    /* Make sure PLL2 matches the current system rate before we derive each
+     * block's MCKDIV from it (no-op unless the rate just changed). */
+    audio_pll2_configure(audio_state.freq);
     extern uint8_t output_types[];
     bool s0_spdif  = output_types[0] == OUTPUT_TYPE_SPDIF;
     bool s1_spdif  = output_types[1] == OUTPUT_TYPE_SPDIF;
@@ -811,7 +851,9 @@ static void audio_configure_sais(void) {
     hsai_template.Init.OutputDrive     = SAI_OUTPUTDRIVE_DISABLE;
     hsai_template.Init.NoDivider       = SAI_MASTERDIVIDER_ENABLE;
     hsai_template.Init.FIFOThreshold   = SAI_FIFOTHRESHOLD_HF;
-    hsai_template.Init.AudioFrequency  = SAI_AUDIO_FREQUENCY_48K;
+    hsai_template.Init.AudioFrequency  = (audio_state.freq == 44100)
+                                         ? SAI_AUDIO_FREQUENCY_44K
+                                         : SAI_AUDIO_FREQUENCY_48K;
     hsai_template.Init.SynchroExt      = SAI_SYNCEXT_DISABLE;
     hsai_template.Init.MonoStereoMode  = SAI_STEREOMODE;
     hsai_template.Init.CompandingMode  = SAI_NOCOMPANDING;
@@ -1265,4 +1307,37 @@ void Audio_HotSwap(void) {
     HAL_NVIC_EnableIRQ(BDMA_Channel1_IRQn);
 
     Audio_Start();
+}
+
+/* Switch the whole output clock to a new sample rate (44100 or 48000) and
+ * re-derive everything that depends on Fs. Driven from the main loop when the
+ * USB host selects a rate (SET_CUR SAM_FREQ). The SAI retune is a deliberate,
+ * infrequent event — Audio_HotSwap mutes the SD pins, retunes PLL2 (inside
+ * audio_configure_sais) and restarts all four blocks from the same aligned
+ * sequence, so inter-slot alignment is preserved across the change. */
+void Audio_SetSampleRate(uint32_t fs) {
+    if (fs != 44100 && fs != 48000) return;   /* only the two advertised rates */
+    if (fs == audio_state.freq) return;
+
+    audio_state.freq = fs;
+
+    /* Recompute coefficients for the new rate before the restart so the first
+     * post-switch audio block uses correct filters/delays. Loudness, crossfeed
+     * and leveller re-key off audio_state.freq via their main-loop pending
+     * flags. */
+    dsp_recalculate_all_filters((float)fs);
+    dsp_update_delay_samples((float)fs);
+    extern volatile bool loudness_recompute_pending, crossfeed_update_pending;
+    extern volatile bool leveller_update_pending, leveller_reset_pending;
+    loudness_recompute_pending = true;
+    crossfeed_update_pending   = true;
+    leveller_update_pending    = true;
+    leveller_reset_pending     = true;
+
+    /* Teardown → PLL2 retune + SAI re-init at the new Fs → aligned restart. */
+    Audio_HotSwap();
+
+    /* Point the USB ISO feedback nominal at the new rate so the host paces its
+     * OUT stream correctly. */
+    usb_audio_set_feedback_rate(fs);
 }

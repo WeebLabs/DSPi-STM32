@@ -57,6 +57,9 @@ void USB_Task(void);       /* tud_task() — call from main loop */
  */
 void Audio_Init(void);
 void Audio_Start(void);
+/* Switch the output clock to a new sample rate (44100 or 48000). Driven from
+ * the main loop when the USB host selects a rate. No-op if already at fs. */
+void Audio_SetSampleRate(uint32_t fs);
 extern volatile uint32_t audio_dma_callbacks;   /* increments on each
                                                    half/cplt — proves the
                                                    DMA pipeline is alive */
