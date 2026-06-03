@@ -11,9 +11,10 @@
  *                             RM0468/HAL select this as INSEL=1; the
  *                             datasheet pin label is one-based.
  *   SPDIFRX peripheral     — D2 domain, APB1L bus, base 0x40004000
- *   Kernel clock           — PLL2_R @ 98.304 MHz (selected via
- *                             RCC_D2CCIP1R.SPDIFSEL = 01); same PLL2
- *                             already powering SAI1/SAI4 audio
+ *   Kernel clock           — PLL3_R @ 120 MHz (PeriphClkInit selects
+ *                             PLL3R for SPDIFRX). A separate PLL from
+ *                             the SAI audio clock (PLL2), so it is fixed
+ *                             and never moves with audio-rate changes.
  *   DMA1 Stream 2 + 3      — request lines 93 (data) and 94 (control)
  *                             via DMAMUX1; both placed in AXI SRAM
  *   No D-cache concerns    — D-cache is OFF through M6a on this build
@@ -21,7 +22,7 @@
  * Sample rate detection method (Stage 1):
  *   SPDIFRX_SR.WIDTH5[14:0] reports the duration of 5 S/PDIF symbols
  *   in spdif_clk periods. Fs ≈ 5 × kclk / (WIDTH5 × 64). At 48 kHz
- *   with a 98.304 MHz kernel clock, WIDTH5 ≈ 160. Updated every IEC
+ *   with a 120 MHz kernel clock, WIDTH5 ≈ 195. Updated every IEC
  *   block.
  *
  * Lock state machine:
@@ -35,6 +36,7 @@
 #include "main.h"
 #include "spdif_input.h"
 #include "audio_input.h"
+#include "usb_audio.h"   /* AudioState audio_state — resampler output rate */
 #include "config.h"
 #include "resampler.h"
 #include <string.h>
@@ -45,9 +47,10 @@
 /* Peripheral kernel-clock source (must match what main.c programs in
  * RCC_D2CCIP1R). Used by spdif_input_poll() to convert WIDTH5 into Hz.
  *
- * Sourced from PLL3_R = 120 MHz. PLL3 is never servo-tuned, so this
- * value is exact (within HSE crystal tolerance) and never moves —
- * unlike the SAI clock on PLL2 which slews under FRACN control. */
+ * Sourced from PLL3_R = 120 MHz. PLL3 is independent of the SAI audio
+ * PLL (PLL2), so this value is exact (within HSE crystal tolerance) and
+ * never moves. Note neither PLL is servo-tuned for S/PDIF lock: rate
+ * matching is done in software by the resampler, not by slewing a PLL. */
 #define SPDIFRX_KERNEL_CLOCK_HZ  120000000U
 
 /* HAL handles — peripheral + the two DMAs (data + control). */
@@ -584,27 +587,25 @@ uint32_t spdif_input_poll(void) {
             sample_rate_hz = fs;
 
             /* Configure the resampler when we first see a valid snapped
-             * source rate — happens once per lock acquisition. */
+             * source rate — happens once per lock acquisition. Output rate is
+             * the live system Fs (audio_state.freq), which the USB host may
+             * have set to 44.1 or 48 kHz; the resampler bridges any input rate
+             * to it. */
             if (!resampler_is_initialised()) {
-                resampler_configure((double)fs, 48000.0);
+                resampler_configure((double)fs, (double)audio_state.freq);
             }
         }
     }
 
-    /* Stage 2: PLL2 FRACN servo runs from main-loop poll cadence. The
-     * fill-level error is the difference between the SPDIF input ring
-     * write head (advanced by DMA callbacks at the source rate) and
-     * the read head (advanced by fill_half at the SAI output rate).
-     * If the source is faster than the sink, gap grows → speed up
-     * SAI by increasing PLL2_P. If slower, shrink PLL2_P.
-     *
-     * Pure integral controller: K_I × fill_error / 100 ms. With the
-     * fill-error deadband at ±1 frame and slew-limited to ±2 FRACN
-     * steps per call (~2.5 ppm / 100 ms = 25 ppm/sec — well below the
-     * 100 ppm/sec safe slew limit), the loop is unconditionally
-     * stable for any source within ±1000 ppm of nominal. Lock time
-     * is ~10 s for a 50 ppm offset, which matches typical consumer
-     * SPDIF source variability. */
+    /* Stage 2: rate-lock servo, run from the main-loop poll cadence.
+     * The fill-level error is the difference between the SPDIF input
+     * ring write head (advanced by DMA callbacks at the source rate)
+     * and the read head (advanced by fill_half at the SAI output rate).
+     * The servo holds that fill at a target latency by trimming the
+     * RESAMPLER RATIO — the SAI output clock (PLL2) is left fixed at its
+     * nominal rate. See servo_tick() for the loop itself. (An earlier
+     * design servoed PLL2 FRACN instead; that path is now vestigial —
+     * see the "PLL2 FRACN servo" block below.) */
     if (spdif_state == SPDIF_INPUT_LOCKED) {
         servo_tick();
     }
@@ -720,17 +721,26 @@ uint32_t spdif_input_pop_frames(float *dst, uint32_t want_frames) {
     return (uint32_t)out_count;
 }
 
-/* ---- PLL2 FRACN servo ----
- * Fill-level integral control. Target a steady fill of ~half the
- * ring (512 frames at 1024-frame ring) to give symmetric headroom
- * either side of nominal lock.
+/* ---- PLL2 FRACN servo (VESTIGIAL — NOT the live rate-lock loop) ----
  *
- * FRACN nominal for our PLL2 config (DIVM=5, DIVN=98, FRACN=2490,
- * DIVP=10): live in main.c's SystemClock_Config. We snapshot it on
- * first servo entry and slew around it. Range ±5000 ppm (full FRACN
- * range) but we clamp to ±200 ppm in practice via the integral
- * accumulator clamp — that's > 4× the worst-case consumer SPDIF
- * tolerance of 50 ppm. */
+ * Everything in this block relating to FRACN/PLL writes — the constants
+ * below, pll2_fracn_write(), the DITHER_* machinery, the widx-rate
+ * tracker — is a leftover from an abandoned approach that locked the
+ * S/PDIF input by slewing the SAI output clock (PLL2 FRACN). That was
+ * dropped: CPU-driven FRACN writes produced audible-band slew
+ * transients, and the planned hardware FRACN-dither engine
+ * (pll_dither.c) was never built (it is not in the CMake build).
+ *
+ * The LIVE rate-lock loop is the RESAMPLER-RATIO servo in servo_tick()
+ * further down. PLL2 FRACN is now a fixed per-output-rate constant set
+ * in audio_out.c / main.c (2490 @ 48 kHz, 2595 @ 44.1 kHz) and is never
+ * servoed. The statics here survive only because the stop-path reset
+ * and the 0xF7 debug snapshot still reference them for diagnostics —
+ * none of them touch the PLL anymore.
+ *
+ * Historical note (the abandoned loop): fill-level integral control,
+ * target ~half the ring (512 of 1024 frames), FRACN nominal 2490 for
+ * the DIVM=5/DIVN=98/DIVP=10 PLL2 config, slewed within ±200 ppm. */
 #define FRACN_MIN              0U
 #define FRACN_MAX              8191U
 #define SPDIF_RING_TARGET_FILL 512    /* ring at half-full = balanced */
@@ -774,17 +784,13 @@ static int32_t  servo_int_acc      = 0;     /* declared above; defined here */
 static uint32_t servo_last_tick_ms = 0;
 
 static void pll2_fracn_write(uint32_t new_fracn) {
-    /* DEPRECATED: kept for legacy spdif_input_stop() reset path, but
-     * the servo no longer calls this directly. CPU-driven FRACN writes
-     * produce sigma-delta slew transients with audible-band spectral
-     * content, even with the documented disable-write-enable sequence.
-     * The audio servo now uses the BDMA-pumped dither engine
-     * (pll_dither.c) which lives entirely in hardware and modulates
-     * FRACN at >50 kHz where transients are inaudible.
-     *
-     * This function still exists because we want a single deterministic
-     * write to push FRACN back to NOMINAL when SPDIF input is stopped —
-     * a one-shot inaudible glitch we accept on source switch. */
+    /* DEAD: not called anywhere (verify with a grep). Retained only as a
+     * reference for the disable-write-enable sequence a FRACN write
+     * requires. The rate-lock servo trims the resampler ratio, not the
+     * PLL, so nothing writes PLL2 FRACN at runtime; the per-output-rate
+     * FRACN value is programmed once in audio_out.c / main.c. CPU-driven
+     * FRACN writes were abandoned because they produce sigma-delta slew
+     * transients with audible-band spectral content. */
     __HAL_RCC_PLL2FRACN_DISABLE();
     __HAL_RCC_PLL2FRACN_CONFIG(new_fracn);
     __HAL_RCC_PLL2FRACN_ENABLE();
@@ -796,16 +802,17 @@ static void pll2_fracn_write(uint32_t new_fracn) {
  * when the target actually changes. */
 static int32_t servo_last_fracn = (int32_t)FRACN_NOMINAL;
 
-/* Diagnostic counter for vendor cmd 0xF7 — how many times the servo
- * has actually moved FRACN. If this stays 0 while LOCKED, the servo
- * is in deadband (good) or starved (bad). */
+/* Diagnostic counter for vendor cmd 0xF7. Despite the name, it now
+ * counts servo_tick() invocations (i.e. resampler-ratio updates) while
+ * LOCKED — it no longer tracks FRACN writes, since the servo doesn't
+ * write FRACN. Kept under the old name for wire/probe compatibility. */
 static uint32_t servo_fracn_writes = 0;
 
-/* Diagnostic: when non-zero, the servo skips its pll2_fracn_write call
- * entirely. Accumulator/LPF still update so we can see what the servo
- * *would* have done; the PLL just isn't touched. Used to test whether
- * the audible dropouts originate from the FRACN-write disturbance vs
- * something elsewhere in the path. Set via vendor cmd 0xF9. */
+/* VESTIGIAL: set/get plumbing for the 0xF9 "freeze servo" debug switch
+ * from the abandoned FRACN-servo era. The live resampler-ratio servo in
+ * servo_tick() does not consult this flag, so toggling it currently has
+ * no effect. Retained only so the vendor command and host probe still
+ * link. */
 static volatile uint8_t servo_frozen = 0;
 void spdif_input_set_servo_frozen(uint8_t frozen) { servo_frozen = frozen; }
 uint8_t spdif_input_get_servo_frozen(void) { return servo_frozen; }

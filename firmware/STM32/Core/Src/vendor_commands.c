@@ -498,11 +498,13 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport,
                                             (tusb_control_request_t *)req,
                                             snap, sizeof(snap));
                 }
-                case 0xF7: {  /* DEBUG (M9): servo state snapshot — fill,
-                               * err, integral accumulator, current
-                               * FRACN, and pll2_fracn_write call count.
-                               * Use to verify the FRACN servo is
-                               * actually moving the PLL during LOCKED. */
+                case 0xF7: {  /* DEBUG (M9): rate-lock servo snapshot —
+                               * ring fill, fill error, and the resampler
+                               * ratio's ppm offset / tick count. (Packet
+                               * fields still say "FRACN" for probe compat;
+                               * the servo trims the resampler ratio, not
+                               * the PLL.) Use to watch lock during
+                               * LOCKED. */
                     static SpdifServoDebugPacket pkt;
                     spdif_input_get_servo_debug(&pkt);
                     return tud_control_xfer(rhport,
