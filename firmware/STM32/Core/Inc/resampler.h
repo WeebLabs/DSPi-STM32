@@ -12,10 +12,12 @@
  * down-sampling. PI controller on the resampling rate, driven by
  * external buffer-fill error (in seconds).
  *
- * Sized for STM32H7 (~165 KB → 41 KB by dropping the polyphase factor
- * 1024 → 256 and the max half-filter length 80 → 40). Quality stays
- * above 16-bit transparent for the SPDIF→SAI use case (1:1 ± ppm,
- * occasional 2:1 / 4:1 downsample for 96k/192k input).
+ * Sized for STM32H7: full 1024-phase polyphase table at max half-filter
+ * length 40 → 40961 floats ≈ 160 KB in AXI SRAM. (The original Teensy
+ * code allows half-length up to 80; we cap at 40, which is ample for the
+ * SPDIF→SAI use case: 1:1 ± ppm, occasional 2:1 / 4:1 downsample for
+ * 96k / 192k input. The 1024 phases keep the fractional-delay
+ * interpolation residual well below 24-bit.)
  */
 
 #ifndef RESAMPLER_H
@@ -27,10 +29,10 @@
 #if defined(STM32H723xx)
 
 /* Tuning constants. Filter table size = MAX_FILTER_SAMPLES floats. */
-#define RESAMPLER_OVERSAMPLING       256
+#define RESAMPLER_OVERSAMPLING       1024
 #define RESAMPLER_MAX_HALF_FILTER    40
 #define RESAMPLER_MAX_FILTER_SAMPLES (RESAMPLER_MAX_HALF_FILTER * RESAMPLER_OVERSAMPLING + 1)
-/* = 10241 floats = ~41 KB. Placed in AXI SRAM. */
+/* = 40961 floats = ~160 KB. Placed in AXI SRAM (see resampler.c map). */
 
 /* PI controller / step adaption parameters. */
 typedef struct {

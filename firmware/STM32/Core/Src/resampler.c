@@ -28,18 +28,22 @@
 /* ---- constants / sizes ---- */
 #define NO_KAISER_SAMPLES   1025      /* Kaiser lookup resolution */
 
-/* ---- placement ----
- * filter[]:           ~41 KB at 0x24014000
- * kaiserScratch_xSq:  ~4 KB  at 0x24024000  (used only during configure)
- * kaiserScratch_temp: ~4 KB  at 0x24025000  (used only during configure)
- * kaiserScratch_win:  ~4 KB  at 0x24026000  (used only during configure)
- * delay_l/r:          640 B  at 0x24027000  (hot path, in AXI but small) */
+/* ---- placement (AXI SRAM, 320 KB at 0x24000000; see audio_out.c map) ----
+ * The 1024-phase filter[] table is ~160 KB and runs 0x24014000 ..
+ * ~0x2403C004, so the Kaiser scratch and the delay line now sit ABOVE it
+ * (they were at 0x2402xxxx when the table was 256-phase / ~41 KB).
+ * filter[]:           ~160 KB at 0x24014000
+ * kaiserScratch_xSq:  ~4 KB   at 0x24040000  (used only during configure)
+ * kaiserScratch_temp: ~4 KB   at 0x24041000  (used only during configure)
+ * kaiserScratch_win:  ~4 KB   at 0x24042000  (used only during configure)
+ * delay_l/r:          320 B   at 0x24044000  (hot path, in AXI but small)
+ * Top of use ~0x24044800 — comfortably under the 0x24050000 ceiling. */
 #define FILTER_TABLE_ADDR     0x24014000UL
-#define KAISER_XSQ_ADDR       0x24024000UL
-#define KAISER_TEMP_ADDR      0x24025000UL
-#define KAISER_WIN_ADDR       0x24026000UL
-#define DELAY_L_ADDR          0x24027000UL
-#define DELAY_R_ADDR          0x24027400UL
+#define KAISER_XSQ_ADDR       0x24040000UL
+#define KAISER_TEMP_ADDR      0x24041000UL
+#define KAISER_WIN_ADDR       0x24042000UL
+#define DELAY_L_ADDR          0x24044000UL
+#define DELAY_R_ADDR          0x24044400UL
 
 static float * const filter =
         (float *)FILTER_TABLE_ADDR;

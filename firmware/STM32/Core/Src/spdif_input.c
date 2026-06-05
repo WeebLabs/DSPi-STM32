@@ -615,14 +615,17 @@ uint32_t spdif_input_poll(void) {
 
 /* Scratch buffers for the resampler — placed in AXI SRAM so they
  * don't pile onto DTCM BSS. Sized to cover one fill_half call of
- * 192 output frames at up to 4× input ratio (192k → 48k). */
+ * 192 output frames at up to 4× input ratio (192k → 48k). Relocated
+ * above the resampler's 1024-phase filter[] table (which now runs to
+ * ~0x2403C004); they previously sat at 0x2402xxxx under the 256-phase
+ * (~41 KB) table. */
 #define POP_INPUT_MAX_FRAMES   512
 #define POP_OUTPUT_MAX_FRAMES  256
 
-#define POP_BUF_INPUT_L_ADDR   0x24020000UL
-#define POP_BUF_INPUT_R_ADDR   0x24020800UL
-#define POP_BUF_OUTPUT_L_ADDR  0x24021000UL
-#define POP_BUF_OUTPUT_R_ADDR  0x24021400UL
+#define POP_BUF_INPUT_L_ADDR   0x2403D000UL
+#define POP_BUF_INPUT_R_ADDR   0x2403D800UL
+#define POP_BUF_OUTPUT_L_ADDR  0x2403E000UL
+#define POP_BUF_OUTPUT_R_ADDR  0x2403E400UL
 
 static float * const pop_in_l  = (float *)POP_BUF_INPUT_L_ADDR;
 static float * const pop_in_r  = (float *)POP_BUF_INPUT_R_ADDR;
